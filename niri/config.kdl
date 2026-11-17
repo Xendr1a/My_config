@@ -157,11 +157,11 @@ binds {
     // spawn 不走 shell，niri 自己的 PATH 里没有 ~/.local/bin，必须显式展开
     Mod+Shift+S hotkey-overlay-title="区域截图 → satty 标注" { spawn-sh "exec ~/.local/bin/screenshot-annotate"; }
     Mod+Shift+O hotkey-overlay-title="区域截图 → OCR 到剪贴板" { spawn-sh "exec ~/.local/bin/ocr-region"; }
-    // Manggo 翻译：本机还没装（yay -S manggo），先留注释。
-    // 装好后删掉下面三行的 // 即可；Wayland 全局热键由 niri 注册，Manggo 未运行时会自动启动。
-    // Mod+A hotkey-overlay-title="选词翻译" { spawn "Manggo" "--action" "selection-translation"; }
-    // Mod+S hotkey-overlay-title="截图翻译" { spawn "Manggo" "--action" "screenshot-translation"; }
-    // Mod+Shift+A hotkey-overlay-title="打开翻译窗口" { spawn "Manggo" "--action" "input-translation"; }
+    // Manggo 翻译：包内容解在 ~/opt/manggo，入口是 ~/.local/bin/Manggo（见 local/bin/Manggo）。
+    // Wayland 全局热键由 niri 注册，Manggo 未运行时会自动启动。
+    Mod+A hotkey-overlay-title="选词翻译" { spawn-sh "exec ~/.local/bin/Manggo --action selection-translation"; }
+    Mod+S hotkey-overlay-title="截图翻译" { spawn-sh "exec ~/.local/bin/Manggo --action screenshot-translation"; }
+    Mod+Shift+A hotkey-overlay-title="打开翻译窗口" { spawn-sh "exec ~/.local/bin/Manggo --action input-translation"; }
     Ctrl+Alt+Right hotkey-overlay-title="下一曲" { spawn "noctalia" "msg" "media" "next"; }
     Ctrl+Alt+Left hotkey-overlay-title="上一曲" { spawn "noctalia" "msg" "media" "previous"; }
     Mod+B hotkey-overlay-title="剪贴板" { spawn "noctalia" "msg" "panel-toggle" "clipboard"; }

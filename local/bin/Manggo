@@ -1,0 +1,4 @@
+#!/bin/sh
+# Manggo（AUR manggo 的包内容解到 ~/opt/manggo，不走 pacman，因为 fakeroot 下 patchelf 会挂）
+# 参数原样透传：Manggo --action selection-translation 等由 niri 键位调用。
+exec "$HOME/opt/manggo/usr/lib/manggo/bin/Manggo" "$@"

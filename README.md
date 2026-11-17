@@ -49,7 +49,7 @@ niri（`Super` 即 Mod）：
 | `Mod+Shift+E` / `Ctrl+Alt+Delete` | 退出 niri 会话；配置修改由 niri 自动重载 |
 | `Mod+Shift+S` | 区域截图 → satty 标注，Enter 复制并存盘到 `~/Pictures/Screenshots` |
 | `Mod+Shift+O` | 区域截图 → tesseract OCR（中英）→ 剪贴板 |
-| `Mod+A` / `Mod+S` / `Mod+Shift+A` | Manggo 选词翻译 / 截图翻译 / 输入翻译（需 `yay -S manggo`，未装时按键无反应） |
+| `Mod+A` / `Mod+S` / `Mod+Shift+A` | Manggo 选词翻译 / 截图翻译 / 输入翻译（装法见「Manggo」一节） |
 | `Mod+Shift+M` | `solo-display`：只留焦点显示器 / 再按恢复全部 |
 | `Print` / `Ctrl+Print` / `Alt+Print` | niri 内置：选区 / 整屏 / 窗口，直接进剪贴板 |
 
@@ -251,6 +251,33 @@ zsh 补全在 `local/completions/_ctfrun`（两个脚本共用，靠 `#compdef c
 
 `systemd/user/hermes-gateway.service` 与 `.d/` 的四个 drop-in 均由 MANIFEST 管理：launch.conf 使用 `/usr/bin/hermes` wrapper，proxy.conf 配置 7897 代理，computer-use-wayland.conf 启用 Wayland，override.conf 保留 `OOMPolicy=continue`。
 
+## Manggo（翻译 / 截图 OCR）
+
+AUR `manggo`（proprietary，1.2.2-2）。本机**不走 pacman 安装**：按 AUR 的 PKGBUILD 打包后把内容解到 `~/opt/manggo`，入口是包装器 `~/.local/bin/Manggo`。
+
+不直接 `yay -S manggo` 的原因：`package()` 里的 `patchelf --set-rpath` 在 fakeroot 下会失败——
+
+```
+bwrap: Creating new namespace failed: Operation not permitted
+```
+
+`fakeroot -- patchelf --print-rpath <file>` 可稳定复现，`env -i patchelf` 就正常，是 fakeroot 的 `LD_PRELOAD` 和 patchelf 打架。跳过那一步是安全的：现有 `DT_RUNPATH` 已经是 `$ORIGIN:$ORIGIN/..:<上游 CI 泄漏路径>`，`$ORIGIN` 在前，补丁只是删掉尾部那条无意义路径。
+
+重现步骤：
+
+```shell
+git clone https://aur.archlinux.org/manggo.git /tmp/mgb && cd /tmp/mgb
+# 注释掉 package() 里的 patchelf 两行
+makepkg -f --noconfirm                      # 产出 manggo-1.2.2-2-x86_64.pkg.tar.zst
+bsdtar -xf manggo-*.pkg.tar.zst -C ~/opt/manggo
+```
+
+`~/.local/bin/Manggo` 只是透传包装器（`exec ~/opt/manggo/usr/lib/manggo/bin/Manggo "$@"`）。三个键位用 `spawn-sh "exec ~/.local/bin/Manggo --action …"`，因为 niri 的 `spawn` 不走 shell、PATH 里没有 `~/.local/bin`。`Manggo --list-actions` 可核对动作名。
+
+登录自启**没开**：第一次按键会自动拉起。想开机常驻就把 `autostart/Manggo.desktop` 复制到 `~/.config/autostart/`（其中 Exec 已指向包装器）。
+
+Manggo 自己的设置（翻译服务、OCR 服务、语言偏好）在它 GUI 里改，配置落在 `~/.config/Manggo/`，不纳入仓库。
+
 ## 与上游的差异（本机未落地项）
 
 仓库继承自 Mel-SRK/My_config，以下上游条目在本机不存在对应硬件或另有替代，故意没有部署：
@@ -262,7 +289,7 @@ zsh 补全在 `local/completions/_ctfrun`（两个脚本共用，靠 `#compdef c
 | `kanshi/config` + `systemd/user/kanshi.service` | 外接屏由 Noctalia `niri-displays` 面板管理（见上一节），kanshi 已装但不用 |
 | `systemd/user/hermes-gateway*` | 本机 Hermes 由 CLI/会话直接跑，没有常驻 gateway 单元 |
 | `system-files/etc/systemd/journald.conf.d/10-size.conf` | 未落地；需要时 `sudo install -Dm644` 后 `sudo systemctl restart systemd-journald` |
-| `autostart/Manggo.desktop` | Manggo 未安装 |
+| `autostart/Manggo.desktop` | 自启没启用（首次按键会拉起 Manggo），Exec 已指向 `~/.local/bin/Manggo` |
 
 截图 / OCR 链路的依赖已装齐（`satty` 0.22、`fzf`、`tesseract-data-chi_sim`、`xdg-desktop-portal-wlr`），
 `test/cases/80-capture.sh` 会现场验证：satty 的四个标志都在 `--help` 里、造图跑一遍 `chi_sim+eng` 能认出关键字。
@@ -270,5 +297,5 @@ zsh 补全在 `local/completions/_ctfrun`（两个脚本共用，靠 `#compdef c
 - `Mod+Shift+O` 的默认语言是 `chi_sim+eng`，只有 `eng` 时中文识别为空——`tesseract-data-chi_sim` 是硬依赖
 - `niri-portals.conf` 把 Screenshot 路由到 wlr 后端，改完要 `systemctl --user restart xdg-desktop-portal.service`
 - `wl-clipboard`：本机不是 pacman 包，是解包到 `~/opt/wl-clipboard` 并软链到 `~/.local/bin`
-- Manggo 仍是可选项：`yay -S manggo`，然后把 `niri/config.kdl` 里注释掉的三行翻译键位放开
+- Manggo 已装成 `~/opt/manggo` + `~/.local/bin/Manggo` 包装器（见上一节），三个翻译键位已启用
 - nvim 插件锁版本留的是本机已装的旧版（上游把 `lazy-lock.json` 整体往前推了一版），要跟上用 `:Lazy update`
