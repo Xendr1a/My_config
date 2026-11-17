@@ -34,7 +34,8 @@ while read -r cmd; do
   PATH=/usr/local/sbin:/usr/local/bin:/usr/bin command -v -- "$cmd" >/dev/null 2>&1 ||
     fail "spawn 引用的 $cmd 必须在系统 PATH（否则改用 spawn-sh 展开 ~）"
   pass "spawn 引用的 $cmd 在系统 PATH"
-done < <(sed -n 's/.*{[[:space:]]*spawn "\([^"]*\)".*/\1/p' "$ROOT/niri/config.kdl" | sort -u)
+done < <(grep -v '^[[:space:]]*//' "$ROOT/niri/config.kdl" |
+  sed -n 's/.*{[[:space:]]*spawn "\([^"]*\)".*/\1/p' | sort -u)
 
 # 选区必须走 niri 截图 UI：grim+slurp 是实时画面，不冻结
 for file in local/bin/screenshot-annotate local/bin/ocr-region; do
@@ -59,11 +60,21 @@ fi
 
 # OCR 管线端到端：造一张带字的图，验证语言包和 psm 组合真能识别
 if command -v tesseract >/dev/null 2>&1 && command -v magick >/dev/null 2>&1; then
-  img="$tmp/ocr.png"
-  magick -size 640x140 xc:white -pointsize 42 -fill black -annotate +30+85 'FLAG ocr region test' "$img"
-  out=$(tesseract "$img" - -l chi_sim+eng --psm 6 2>/dev/null) || fail 'tesseract 能处理测试图'
-  grep -q 'FLAG' <<< "$out" || fail 'OCR 识别出英文关键字' "$out"
-  pass 'OCR 识别出英文关键字'
+  langs=$(tesseract --list-langs 2>/dev/null | tail -n +2 | tr '\n' ' ')
+  if [[ " $langs " != *" chi_sim "* ]]; then
+    skip 'OCR 管线端到端' '缺少 chi_sim 语言包（tesseract-data-chi_sim）：Mod+Shift+O 的中文识别需要它'
+  else
+    img="$tmp/ocr.png"
+    # ImageMagick 没有内置默认字体，必须显式给一个 fontconfig 能解析的字体文件
+    font_args=()
+    font=$(fc-match -f '%{file}' sans 2>/dev/null || true)
+    [[ -n "${font:-}" && -r "$font" ]] && font_args=(-font "$font")
+    magick -size 640x140 xc:white -pointsize 42 -fill black "${font_args[@]}" \
+      -annotate +30+85 'FLAG ocr region test' "$img"
+    out=$(tesseract "$img" - -l chi_sim+eng --psm 6 2>/dev/null) || fail 'tesseract 能处理测试图'
+    grep -q 'FLAG' <<< "$out" || fail 'OCR 识别出英文关键字' "$out"
+    pass 'OCR 识别出英文关键字'
+  fi
 else
   skip 'OCR 管线端到端' '缺少 tesseract 或 magick'
 fi

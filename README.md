@@ -1,6 +1,8 @@
 # My_config
 
-这台 ThinkPad T14 Gen4 (AMD) 上 Arch + niri + Noctalia 的配置留档。
+这台 COLORFUL G16 24（主机名 `Xen`）上 Arch + niri + Noctalia 的配置留档。
+
+仓库来自 [Mel-SRK/My_config](https://github.com/Mel-SRK/My_config)，保留其目录结构、`install.sh` / `MANIFEST.tsv` 校验体系；本机的输出布局、终端与 shell 启动方式按实际硬件改过。
 
 ## 预览
 
@@ -24,9 +26,10 @@
 
 - 合成器 **niri 26.04**（滚动式列布局）；桌面 Shell **Noctalia v5**（`extra/noctalia`，二进制 `noctalia`）
 - 登录器 **greetd + noctalia-greeter**（`/etc/greetd/config.toml`），`sddm` 已 disabled
-- 显示：内屏 `eDP-1` 2240x1400@60.002 scale 1.15（`position x=2560`）；外接 `DP-1` HKC G27H2Max 2560x1440@200 scale 1（`position 0,0`）；热插拔切换交给 kanshi
+- 显示：内屏 `eDP-1` 2560x1600@240 scale 1.25（BOE，`position x=5440 y=-700`）；外接 `HDMI-A-1` 1920x1080@240 scale 1（`position x=3520 y=360`）；布局与热插拔由 Noctalia 的 `niri-displays` 面板维护，写在 `niri/outputs.kdl`（不用 kanshi）
 - 终端 alacritty；shell zsh + oh-my-zsh（`/usr/share/oh-my-zsh`）+ powerlevel10k
 - 输入法 fcitx5，当前默认 `pinyin`，保留 `qingjian`；X11/Java 应用走 xwayland-satellite
+- 终端启动即进 tmux：`alacritty` 的 `[terminal.shell]` 直接 `tmux new-session -A -s Xendr1a`，`.zshrc` 里不再 attach
 - 代理统一 `127.0.0.1:7897`（Clash Verge）；防火墙 firewalld（`nftables.service` 未启用）
 
 ## 键位速查
@@ -46,7 +49,8 @@ niri（`Super` 即 Mod）：
 | `Mod+Shift+E` / `Ctrl+Alt+Delete` | 退出 niri 会话；配置修改由 niri 自动重载 |
 | `Mod+Shift+S` | 区域截图 → satty 标注，Enter 复制并存盘到 `~/Pictures/Screenshots` |
 | `Mod+Shift+O` | 区域截图 → tesseract OCR（中英）→ 剪贴板 |
-| `Mod+A` / `Mod+S` / `Mod+Shift+A` | Manggo 选词翻译 / 截图翻译 / 输入翻译（自动启动，无需在应用内注册热键） |
+| `Mod+A` / `Mod+S` / `Mod+Shift+A` | Manggo 选词翻译 / 截图翻译 / 输入翻译（需 `yay -S manggo`，未装时按键无反应） |
+| `Mod+Shift+M` | `solo-display`：只留焦点显示器 / 再按恢复全部 |
 | `Print` / `Ctrl+Print` / `Alt+Print` | niri 内置：选区 / 整屏 / 窗口，直接进剪贴板 |
 
 媒体键 `Ctrl+Alt+Left/Right` 或 `XF86AudioPrev/Next`，亮度走 `noctalia msg brightness-up/down`（不再用 brightnessctl）。
@@ -76,15 +80,20 @@ Orca 内的 `Ctrl+W` 会关闭应用标签页，窗口操作使用上面的 `<le
 ## 装机
 
 ```shell
-# 1. 装包
-sudo pacman -S niri noctalia kanshi greetd xwayland-satellite alacritty tmux neovim \
-               zsh fcitx5 fcitx5-chinese-addons fcitx5-qt fcitx5-gtk \
-               swaybg firejail pwndbg qt6ct
-# 非官方仓库：oh-my-zsh-git（提供 /usr/share/oh-my-zsh）、noctalia-greeter-git、fuck（= thefuck）
-# powerlevel10k / zsh-autosuggestions / zsh-syntax-highlighting 放在 ~/.oh-my-zsh/custom/（git clone）
+# 1. 装包：packages/official.txt 与 packages/foreign.txt 是本机实际包清单，重新装机时按它补
+./tool/mycfg-pkgs install      # 打印缺哪些、怎么装（不执行）
+# 关键几项（其余见清单）：
+sudo pacman -S niri noctalia noctalia-greeter-git greetd xwayland-satellite alacritty tmux neovim \
+               zsh fcitx5 fcitx5-chinese-addons fcitx5-qt fcitx5-gtk fcitx5-qingjian-git \
+               kanshi swaybg firejail pwndbg qt6ct jq satty fzf wl-clipboard \
+               tesseract tesseract-data-chi_sim tesseract-data-eng \
+               xdg-desktop-portal-gnome xdg-desktop-portal-gtk xdg-desktop-portal-wlr
+# 非官方仓库：oh-my-zsh-git（提供 /usr/share/oh-my-zsh）、yay、niri-display-settings-git、manggo（翻译，可选）
+# powerlevel10k 走 zsh-theme-powerlevel10k-git；zsh-autosuggestions / zsh-syntax-highlighting 也在 official 清单
+# p10k instant prompt 需要 ~/.p10k.zsh（MANIFEST 里 home 之外的 p10k/.p10k.zsh）
 
-# 2. 取仓库并安装
-git clone https://github.com/Mel-SRK/My_config && cd My_config
+# 2. 取仓库并安装（本机就是这套配置的源）
+git clone https://github.com/Xendr1a/My_config && cd My_config
 ./install.sh            # 只打印计划
 ./install.sh --apply    # 真正写入（root 条目仍只打印 sudo 命令）
 
@@ -133,17 +142,16 @@ greetd 的两个文件（`/etc/greetd/config.toml`、`/etc/pam.d/greetd`）装�
 
 换机器或重装后先运行 `tool/mycfg-pkgs install` 并手动执行它打印的装包命令，再运行 `./install.sh`。`install.sh` 结尾会自动提示缺包数量。
 
-## 外接显示器（kanshi）
+## 外接显示器（Noctalia niri-displays 面板）
 
-| profile | 触发 | 结果 |
-|---|---|---|
-| `docked-dp1` | 插上 DP-1 | `eDP-1` 关闭，`DP-1` 2560x1440@200 scale 1 |
-| `docked-dp2` | 插上 DP-2 | 双屏：DP-2 在左 200Hz，eDP-1 在右 scale 1.15 |
-| `mobile` | 拔掉全部外接屏 | `eDP-1` 2240x1400@60.002 scale 1.15 |
+本机不用 kanshi：输出布局由 Noctalia 的 `niri-displays` 插件（`niri-display-settings-git`）管理，右上角显示器图标就是面板。
 
-`mobile` 里必须显式写 `enable`，否则 kanshi 匹配到了却无法重新启用被关过的 `eDP-1`。kanshi 判断的是物理连接状态：DP-1 接线保持 docked-dp1，DP-2 接线保持 docked-dp2，外接全部拔掉才回 mobile。
+- `niri/config.kdl` 里没有 `output` 块，只有 `include "outputs.kdl"`；面板每次改动都会重写 `~/.config/niri/outputs.kdl`（已收进 MANIFEST，标记 `state`）
+- 关闭（off）状态不写进 `outputs.kdl`，避免拔掉外接屏后一个可用输出都没有
+- `~/.config/niri/displays-policy.json` 是面板策略：`{"focus_external":true,"internal_off_with_external":true}` = 接外接屏时关内屏、焦点落在外接屏
+- 想要"只留当前屏 / 全部打开"又不进面板：`Mod+Shift+M` 跑 `local/bin/solo-display`（toggle，可带 `solo` / `all` 参数，依赖 `niri msg -j` + `jq`）
 
-刷新率在 niri `output` 块和 kanshi profile 里各写一份，两处必须一致；不一致会看到启动后被反复切换。
+手动改 `outputs.kdl` 也能生效，但下次在面板里动一下就会被覆盖。
 
 ## Noctalia v5
 
@@ -242,3 +250,29 @@ zsh 补全在 `local/completions/_ctfrun`（两个脚本共用，靠 `#compdef c
 ## Hermes gateway
 
 `systemd/user/hermes-gateway.service` 与 `.d/` 的四个 drop-in 均由 MANIFEST 管理：launch.conf 使用 `/usr/bin/hermes` wrapper，proxy.conf 配置 7897 代理，computer-use-wayland.conf 启用 Wayland，override.conf 保留 `OOMPolicy=continue`。
+
+## 与上游的差异（本机未落地项）
+
+仓库继承自 Mel-SRK/My_config，以下上游条目在本机不存在对应硬件或另有替代，故意没有部署：
+
+| 上游条目 | 本机情况 |
+|---|---|
+| `micmute-led/`（脚本 + user 服务 + udev 规则） | 本机 `/sys/class/leds/` 没有麦克风静音 LED 节点，ThinkPad 专有 |
+| `system-files/etc/udev/hwdb.d/61-battery-local.hwdb` | `BAT0` 没有 `charge_control_start_threshold`，不支持充电阈值 |
+| `kanshi/config` + `systemd/user/kanshi.service` | 外接屏由 Noctalia `niri-displays` 面板管理（见上一节），kanshi 已装但不用 |
+| `systemd/user/hermes-gateway*` | 本机 Hermes 由 CLI/会话直接跑，没有常驻 gateway 单元 |
+| `system-files/etc/systemd/journald.conf.d/10-size.conf` | 未落地；需要时 `sudo install -Dm644` 后 `sudo systemctl restart systemd-journald` |
+| `autostart/Manggo.desktop` | Manggo 未安装 |
+
+还差几个包才能让上游新功能真正可用（都需要 sudo）：
+
+```shell
+sudo pacman -S --needed satty fzf tesseract-data-chi_sim xdg-desktop-portal-wlr
+yay -S manggo      # 可选：翻译，装了之后 Mod+A/Mod+S/Mod+Shift+A 才有反应
+```
+
+- `satty`：`Mod+Shift+S` 截图标注没有它会在标注阶段退出
+- `tesseract-data-chi_sim`：`Mod+Shift+O` 的默认语言是 `chi_sim+eng`，只有 `eng` 时中文识别为空
+- `xdg-desktop-portal-wlr`：`niri-portals.conf` 把 Screenshot 路由到 wlr 后端；装完执行 `systemctl --user restart xdg-desktop-portal.service`
+- `wl-clipboard`：本机不是 pacman 包，是解包到 `~/opt/wl-clipboard` 并软链到 `~/.local/bin`；`wl-copy`/`wl-paste` 可用
+- nvim 插件锁版本留的是本机已装的旧版（上游把 `lazy-lock.json` 整体往前推了一版），要跟上用 `:Lazy update`
