@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# solo-display —— 只留当前（焦点）显示器；再次执行则全部打开
+#
+#   solo-display          # toggle：只剩一块屏就全开，否则只留焦点屏（默认）
+#   solo-display solo     # 只留焦点屏
+#   solo-display all      # 全部打开
+#
+# 依赖：niri msg、jq
+
+set -euo pipefail
+
+mode="${1:-toggle}"
+
+notify() {
+    command -v notify-send >/dev/null 2>&1 && notify-send -a "solo-display" "$1" "$2" || true
+}
+
+all=$(niri msg -j outputs | jq -r 'keys[]')
+enabled=$(niri msg -j outputs | jq -r 'to_entries[] | select(.value.logical != null) | .key')
+
+if [ -z "$all" ]; then
+    echo "solo-display: 没有检测到任何显示器" >&2
+    exit 1
+fi
+
+n_enabled=$(printf '%s\n' "$enabled" | grep -c .)
+
+turn_all_on() {
+    local o
+    while read -r o; do
+        [ -n "$o" ] || continue
+        niri msg output "$o" on >/dev/null
+    done <<< "$all"
+}
+
+if [ "$mode" = "all" ] || { [ "$mode" = "toggle" ] && [ "$n_enabled" -le 1 ]; }; then
+    turn_all_on
+    notify "显示器" "已全部打开"
+    echo "已全部打开：$(echo $all)"
+    exit 0
+fi
+
+focus=$(niri msg -j focused-output | jq -r '.name')
+
+# 焦点屏不在启用列表里（正常不会发生）时，退回“第一块启用的屏”
+if ! grep -qxF "$focus" <<< "$enabled"; then
+    focus=$(printf '%s\n' "$enabled" | head -n1)
+fi
+
+while read -r o; do
+    [ -n "$o" ] || continue
+    [ "$o" = "$focus" ] || niri msg output "$o" off >/dev/null
+done <<< "$enabled"
+
+notify "显示器" "只留当前屏：$focus"
+echo "只留当前屏：$focus"

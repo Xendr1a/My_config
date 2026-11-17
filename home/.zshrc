@@ -1,38 +1,3 @@
-# 登录即进 tmux。必须放在 p10k instant prompt 之前：
-# instant prompt 会重定向 fd 0/1/2 且到 zshrc 末尾才恢复，放在后面 attach 必然失败。
-# 终端总是进 TS2K；只有当 TS2K 已被别的终端占用时，才开独立视图（session group）：
-# 同一 group 内窗口列表共享、当前窗口各自独立，多个终端互不干扰。
-# exec 让 tmux 取代 shell：退出 tmux 即退出终端，不会落回 zsh；
-# 视图客户端断开时由 destroy-unattached 自毁，不残留、不越堆越多。
-# Orca 的终端面板不自动 attach：它的 PTY 是登录 shell，exec tmux 后会和主终端
-# 共用 TS2K，还会让 Orca 等 shell-ready 超时才把启动命令敲进去。Orca 里要 tmux 手动敲。
-if [[ -z "$TMUX" && "$TERM_PROGRAM" != "Orca" && -o interactive && -t 0 && -t 1 && -n "$TERM" && "$TERM" != "dumb" ]]; then
-    if ! tmux has-session -t '=TS2K' 2>/dev/null; then
-        exec tmux new-session -A -s TS2K
-    fi
-
-    # TS2K 没人占用：优先回到主会话（等同开机首个终端）
-    if [[ "$(tmux display -p -t TS2K '#{session_attached}' 2>/dev/null)" == 0 ]]; then
-        exec tmux attach -t '=TS2K'
-    fi
-
-    # TS2K 已被占用：占用编号最小的空闲视图
-    for i in {1..9}; do
-        s="view$i"
-        tmux has-session -t "=$s" 2>/dev/null ||
-            tmux new-session -d -t '=TS2K' -s "$s" 2>/dev/null
-        if [[ "$(tmux display -p -t "$s" '#{session_attached}' 2>/dev/null)" == 0 ]]; then
-            # 该 client 断开后视图会话自动销毁（视图只在这个终端存活期间存在）
-            tmux set-hook -t "$s" client-attached \
-                "set-option -t $s destroy-unattached on" 2>/dev/null
-            exec tmux attach -t "=$s"
-        fi
-    done
-
-    # 视图全部占满：退回主会话；若 TS2K 恰好刚消失则直接重建
-    exec tmux new-session -A -s TS2K
-fi
-
 # 提示符、补全、插件只在真的有终端时加载。工具用管道跑 `zsh -i -c` 时没有控制终端，
 # job control 开不起来：powerlevel10k 的 gitstatus 在 `setopt monitor` 处失败，
 # 先打印 can't change option: monitor，再打印 gitstatus failed to initialize，
@@ -48,6 +13,7 @@ case ":$PATH:" in
 esac
 export EDITOR="nvim"
 export VISUAL="nvim"
+
 # 与 environment.d/qt-theme.conf 一致；覆盖旧会话继承的 qt5ct。
 export QT_QPA_PLATFORMTHEME=qt6ct
 
@@ -61,6 +27,10 @@ __proxy_bypass=(localhost 127.0.0.1 ::1 "${(@s:,:)no_proxy}" "${(@s:,:)NO_PROXY}
 export no_proxy="${(j:,:)__proxy_bypass:#}"
 export NO_PROXY="$no_proxy"
 unset __proxy_bypass
+
+# 登录进 tmux 由 alacritty 的 [terminal.shell] 负责（见 ~/.config/alacritty/alacritty.toml），
+# 这里不再 attach：p10k instant prompt 会接管 stdin，放在 zshrc 里必报
+# "open terminal failed: not a terminal"。
 
 if (( __have_tty )); then
     # Enable Powerlevel10k instant prompt
@@ -105,7 +75,7 @@ if (( __have_tty )); then
         eval "$(thefuck --alias)"
     fi
 
-    # Oh-my-pi
+    # Oh-my-pi（本机未装则跳过）
     if command -v omp >/dev/null 2>&1; then
         eval "$(omp completions zsh)"
     fi

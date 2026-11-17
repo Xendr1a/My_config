@@ -10,3 +10,10 @@ style = "Regular"
 
 [window]
 opacity = 0.85
+
+# 打开 alacritty 即进入 tmux 会话 Xendr1a（有则 attach，无则新建）
+# 之所以放在这里而不是 .zshrc：powerlevel10k 的 instant prompt 会接管 stdin，
+# 在 .zshrc 里调 tmux 会报 "open terminal failed: not a terminal"。
+[terminal.shell]
+program = "/usr/bin/tmux"
+args = ["new-session", "-A", "-s", "Xendr1a"]
