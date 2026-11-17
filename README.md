@@ -264,15 +264,11 @@ zsh 补全在 `local/completions/_ctfrun`（两个脚本共用，靠 `#compdef c
 | `system-files/etc/systemd/journald.conf.d/10-size.conf` | 未落地；需要时 `sudo install -Dm644` 后 `sudo systemctl restart systemd-journald` |
 | `autostart/Manggo.desktop` | Manggo 未安装 |
 
-还差几个包才能让上游新功能真正可用（都需要 sudo）：
+截图 / OCR 链路的依赖已装齐（`satty` 0.22、`fzf`、`tesseract-data-chi_sim`、`xdg-desktop-portal-wlr`），
+`test/cases/80-capture.sh` 会现场验证：satty 的四个标志都在 `--help` 里、造图跑一遍 `chi_sim+eng` 能认出关键字。
 
-```shell
-sudo pacman -S --needed satty fzf tesseract-data-chi_sim xdg-desktop-portal-wlr
-yay -S manggo      # 可选：翻译，装了之后 Mod+A/Mod+S/Mod+Shift+A 才有反应
-```
-
-- `satty`：`Mod+Shift+S` 截图标注没有它会在标注阶段退出
-- `tesseract-data-chi_sim`：`Mod+Shift+O` 的默认语言是 `chi_sim+eng`，只有 `eng` 时中文识别为空
-- `xdg-desktop-portal-wlr`：`niri-portals.conf` 把 Screenshot 路由到 wlr 后端；装完执行 `systemctl --user restart xdg-desktop-portal.service`
-- `wl-clipboard`：本机不是 pacman 包，是解包到 `~/opt/wl-clipboard` 并软链到 `~/.local/bin`；`wl-copy`/`wl-paste` 可用
+- `Mod+Shift+O` 的默认语言是 `chi_sim+eng`，只有 `eng` 时中文识别为空——`tesseract-data-chi_sim` 是硬依赖
+- `niri-portals.conf` 把 Screenshot 路由到 wlr 后端，改完要 `systemctl --user restart xdg-desktop-portal.service`
+- `wl-clipboard`：本机不是 pacman 包，是解包到 `~/opt/wl-clipboard` 并软链到 `~/.local/bin`
+- Manggo 仍是可选项：`yay -S manggo`，然后把 `niri/config.kdl` 里注释掉的三行翻译键位放开
 - nvim 插件锁版本留的是本机已装的旧版（上游把 `lazy-lock.json` 整体往前推了一版），要跟上用 `:Lazy update`
