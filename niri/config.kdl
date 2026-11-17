@@ -319,7 +319,6 @@ binds {
     Mod+Shift+P hotkey-overlay-title="关闭显示器" { power-off-monitors; }
 
     // 只留当前（焦点）显示器；再按一次全部打开。脚本：~/.local/bin/solo-display
-    // 只留当前（焦点）显示器；再按一次全部打开。脚本：~/.local/bin/solo-display
     Mod+Shift+M hotkey-overlay-title="只留当前显示器 / 全部打开" { spawn-sh "exec ~/.local/bin/solo-display"; }
 }
 include "./noctalia.kdl"
