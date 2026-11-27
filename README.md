@@ -1,6 +1,6 @@
 # My_config
 
-这台 COLORFUL G16 24（主机名 `Xen`）上 Arch + niri + Noctalia 的配置留档。
+这台机器上 Arch + niri + Noctalia 的配置留档。机型、主机名与显示布局写在下面的[当前环境](#当前环境)，由 `./doctor/doctor --render` 从真机事实生成。
 
 仓库来自 [Mel-SRK/My_config](https://github.com/Mel-SRK/My_config)，保留其目录结构、`install.sh` / `MANIFEST.tsv` 校验体系；本机的输出布局、终端与 shell 启动方式按实际硬件改过。
 
@@ -17,6 +17,7 @@
 | `system-files/` | `/etc` 与 `/usr/local` 下手工改过的文件 |
 | `archive/` | 已退役方案，只作历史留档，不要部署 |
 | `tools/check-sync.sh` | 比对仓库与实机，只读 |
+| `doctor/` | 环境事实基线 `facts.toml` 与自检脚本；漂移非零退出 |
 | `packages/` | 重装时要装的包清单（official / foreign） |
 | `migrations/` | 一次性状态修复脚本 |
 | `test/` | 本地测试集 |
@@ -26,11 +27,30 @@
 
 - 合成器 **niri 26.04**（滚动式列布局）；桌面 Shell **Noctalia v5**（`extra/noctalia`，二进制 `noctalia`）
 - 登录器 **greetd + noctalia-greeter**（`/etc/greetd/config.toml`），`sddm` 已 disabled
-- 显示：内屏 `eDP-1` 2560x1600@240 scale 1.25（BOE，`position x=5440 y=-700`）；外接 `HDMI-A-1` 1920x1080@240 scale 1（`position x=3520 y=360`）；布局与热插拔由 Noctalia 的 `niri-displays` 面板维护，写在 `niri/outputs.kdl`（不用 kanshi）
-- 终端 alacritty；shell zsh + oh-my-zsh（`/usr/share/oh-my-zsh`）+ powerlevel10k
+<!-- doctor:begin environment -->
+- 机型 **COLORFUL G16 24**，主机名 `Xen`
+- 显示：`eDP-1` **2560x1600@240** scale 1.5（BOE，位置 x=5440 y=-700）；`HDMI-A-1` **1920x1080@240** scale 1（PNP(SAC)，位置 x=3520 y=360）
+- 终端 **alacritty**（真机已装：`alacritty`、`foot`）
+<!-- doctor:end environment -->
+
+- 显示布局与热插拔由 Noctalia 的 `niri-displays` 面板维护，写在 `niri/outputs.kdl`（不用 kanshi）
+- shell zsh + oh-my-zsh（`/usr/share/oh-my-zsh`）+ powerlevel10k
 - 输入法 fcitx5，当前默认 `pinyin`，保留 `qingjian`；X11/Java 应用走 xwayland-satellite
 - 终端启动即进 tmux：`alacritty` 的 `[terminal.shell]` 直接 `tmux new-session -A -s Xendr1a`，`.zshrc` 里不再 attach
 - 代理统一 `127.0.0.1:7897`（Clash Verge）；防火墙 firewalld（`nftables.service` 未启用）
+
+## 环境自检（doctor）
+
+`doctor/facts.toml` 是唯一事实基线：由真机采集，可编辑、可 diff。`./doctor/doctor` 用它对照 README 的 `doctor:begin/end environment` 段、`kanshi/config`、`MANIFEST.tsv` 与当前真机；全部一致退出 0，任一漂移退出 1，并指出文件和行号。
+
+```shell
+./doctor/doctor                     # 检查
+./doctor/doctor --refresh           # 从 /sys/class/dmi/id、niri msg --json outputs、已装终端重采事实
+./doctor/doctor --render            # 按事实重写 README 环境段
+./doctor/doctor --refresh --render  # 硬件或布局变了以后一次改完
+```
+
+doctor 只读 niri、kanshi、alacritty、noctalia 的配置，不会为了变绿去改它们；kanshi 与 MANIFEST 的漂移交回各自维护者。
 
 ## 键位速查
 
@@ -128,6 +148,7 @@ greetd 的两个文件（`/etc/greetd/config.toml`、`/etc/pam.d/greetd`）装�
 运行 `./test/run` 执行 `test/cases/` 下的本地用例；`./test/run --host` 额外检查实机漂移。
 可以用 `./test/run --filter manifest` 筛选文件名。失败时看输出中的日志路径，
 每个用例的完整 stdout/stderr 都保留在打印的日志目录中。
+`./test/run --filter doctor` 只跑环境自检用例（需要可用的 niri 会话）。
 
 ## 软件包
 

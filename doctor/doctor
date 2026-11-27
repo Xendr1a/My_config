@@ -1,0 +1,884 @@
+#!/usr/bin/env python3
+"""My_config 环境自检。
+
+事实基线在 doctor/facts.toml，由真机采集，不手填。doctor 拿它对照：
+  * README 的 doctor environment 段（机型、主机名、输出、终端）
+  * kanshi/config 声明的输出与模式
+  * MANIFEST.tsv 的仓库源路径
+  * 当前真机（/sys/class/dmi/id、niri msg --json outputs、已装终端）
+全部一致退出 0，任一漂移退出 1，运行环境不满足退出 2。
+
+用法：
+  ./doctor/doctor                 对照检查
+  ./doctor/doctor --refresh       从真机重采事实并重写 doctor/facts.toml
+  ./doctor/doctor --render        按事实重写 README 环境段
+  ./doctor/doctor --refresh --render
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tomllib
+import unicodedata
+from pathlib import Path
+
+MARK_BEGIN = "<!-- doctor:begin environment -->"
+MARK_END = "<!-- doctor:end environment -->"
+TERMINALS = (
+    "alacritty",
+    "foot",
+    "kitty",
+    "wezterm",
+    "ghostty",
+    "konsole",
+    "xfce4-terminal",
+    "gnome-terminal",
+    "rio",
+    "st",
+    "urxvt",
+)
+MODE_RE = re.compile(r"^(\d+)x(\d+)@([0-9]+(?:\.[0-9]+)?)$")
+
+
+class DoctorError(Exception):
+    pass
+
+
+# ---------- 通用 ----------
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise DoctorError(f"读不到 {path}：{exc}") from exc
+
+
+def relative(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def display_width(text: str) -> int:
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+
+
+def pad(text: str, width: int) -> str:
+    return text + " " * max(0, width - display_width(text))
+
+
+def clip(text: str, width: int = 52) -> str:
+    if display_width(text) <= width:
+        return text
+    out: list[str] = []
+    used = 0
+    for ch in text:
+        step = 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+        if used + step > width - 1:
+            break
+        out.append(ch)
+        used += step
+    return "".join(out) + "…"
+
+
+def mode_parts(mode: str) -> tuple[int, int, float] | None:
+    match = MODE_RE.match(mode)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), float(match.group(3))
+
+
+def short_mode(mode: str) -> str:
+    """2560x1600@240.000 -> 2560x1600@240，只用于人类可读输出。"""
+    if "@" not in mode:
+        return mode
+    size, rate = mode.split("@", 1)
+    try:
+        return f"{size}@{float(rate):.3f}".rstrip("0").rstrip(".")
+    except ValueError:
+        return mode
+
+
+def short_number(value: float) -> str:
+    return f"{float(value):g}"
+
+
+def dotenv(value: str) -> str:
+    """TOML 基本字符串；JSON 的转义对其兼容。"""
+    return json.dumps(value, ensure_ascii=False)
+
+
+# ---------- 真机采集 ----------
+
+
+def read_dmi(name: str) -> str:
+    try:
+        return Path(f"/sys/class/dmi/id/{name}").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def detect_primary_terminal(config: Path, installed: list[str]) -> str:
+    if config.is_file():
+        text = read_text(config)
+        for match in re.finditer(r'\bspawn(?:-sh)?\s+"([^"]+)"', text):
+            first = match.group(1).split()[0] if match.group(1).split() else ""
+            base = os.path.basename(first)
+            if base in installed:
+                return base
+    return installed[0] if installed else ""
+
+
+def collect(root: Path) -> dict:
+    vendor = read_dmi("sys_vendor")
+    product = read_dmi("product_name")
+    hostname = socket.gethostname()
+
+    niri = shutil.which("niri")
+    if niri is None:
+        raise DoctorError("找不到 niri，无法读取当前输出；请在 niri 会话里运行")
+    proc = subprocess.run(
+        [niri, "msg", "--json", "outputs"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        raise DoctorError(f"niri msg --json outputs 失败：{detail[0] if detail else proc.returncode}")
+    try:
+        raw = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise DoctorError(f"niri msg 输出不是合法 JSON：{exc}") from exc
+
+    outputs: list[dict] = []
+    for name in sorted(raw, key=str.casefold):
+        item = raw[name]
+        modes = [
+            f"{mode['width']}x{mode['height']}@{mode['refresh_rate'] / 1000:.3f}"
+            for mode in item.get("modes", [])
+        ]
+        index = item.get("current_mode")
+        if not isinstance(index, int) or not 0 <= index < len(modes):
+            raise DoctorError(f"输出 {name} 的 current_mode 无效：{index!r}")
+        logical = item.get("logical") or {}
+        transform = str(logical.get("transform", "normal")).lower()
+        outputs.append(
+            {
+                "name": name,
+                "make": str(item.get("make", "")).strip(),
+                "model": str(item.get("model", "")).strip(),
+                "current": modes[index],
+                "modes": modes,
+                "scale": float(logical.get("scale", 1)),
+                "position": [int(logical.get("x", 0)), int(logical.get("y", 0))],
+                "transform": transform,
+            }
+        )
+
+    installed = [name for name in TERMINALS if shutil.which(name)]
+    primary = detect_primary_terminal(root / "niri/config.kdl", installed)
+
+    return {
+        "machine": {"vendor": vendor, "product": product, "hostname": hostname},
+        "terminal": {"primary": primary, "installed": installed},
+        "outputs": outputs,
+    }
+
+
+# ---------- facts.toml ----------
+
+
+def facts_text(facts: dict) -> str:
+    machine = facts["machine"]
+    terminal = facts["terminal"]
+    lines = [
+        "# 真机事实基线：由 ./doctor/doctor --refresh 采集，勿手改。",
+        "# doctor 用它对照 README 环境段、kanshi/config 与当前真机。",
+        "",
+        "[machine]",
+        f"vendor = {dotenv(machine['vendor'])}",
+        f"product = {dotenv(machine['product'])}",
+        f"hostname = {dotenv(machine['hostname'])}",
+        "",
+        "[terminal]",
+        f"primary = {dotenv(terminal['primary'])}",
+        "installed = [" + ", ".join(dotenv(item) for item in terminal["installed"]) + "]",
+    ]
+    for output in facts["outputs"]:
+        lines += [
+            "",
+            "[[outputs]]",
+            f"name = {dotenv(output['name'])}",
+            f"make = {dotenv(output['make'])}",
+            f"model = {dotenv(output['model'])}",
+            f"current = {dotenv(output['current'])}",
+            f"scale = {float(output['scale'])!r}",
+            f"position = [{output['position'][0]}, {output['position'][1]}]",
+            f"transform = {dotenv(output['transform'])}",
+        ]
+        if len(output["modes"]) > 4:
+            lines.append("modes = [")
+            lines.extend(f"    {dotenv(item)}," for item in output["modes"])
+            lines.append("]")
+        else:
+            lines.append("modes = [" + ", ".join(dotenv(item) for item in output["modes"]) + "]")
+    return "\n".join(lines) + "\n"
+
+
+def load_facts(path: Path) -> dict:
+    try:
+        with path.open("rb") as handle:
+            facts = tomllib.load(handle)
+    except OSError as exc:
+        raise DoctorError(f"读不到事实文件 {path}；先运行 ./doctor/doctor --refresh") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise DoctorError(f"{path} 不是合法 TOML：{exc}") from exc
+
+    def need(section: str, key: str, kind: type):
+        table = facts.get(section)
+        if not isinstance(table, dict) or key not in table:
+            raise DoctorError(f"{path} 缺少 [{section}].{key}；先运行 ./doctor/doctor --refresh")
+        if not isinstance(table[key], kind):
+            raise DoctorError(f"{path} 的 [{section}].{key} 类型不对")
+        return table[key]
+
+    need("machine", "vendor", str)
+    need("machine", "product", str)
+    need("machine", "hostname", str)
+    need("terminal", "primary", str)
+    need("terminal", "installed", list)
+    if not isinstance(facts.get("outputs"), list) or not facts["outputs"]:
+        raise DoctorError(f"{path} 缺少 [[outputs]]；先运行 ./doctor/doctor --refresh")
+    for index, output in enumerate(facts["outputs"]):
+        if not isinstance(output, dict):
+            raise DoctorError(f"{path} 的 [[outputs]] 第 {index + 1} 项不是表")
+        for key, kind in (
+            ("name", str),
+            ("make", str),
+            ("model", str),
+            ("current", str),
+            ("scale", (int, float)),
+            ("position", list),
+            ("transform", str),
+            ("modes", list),
+        ):
+            if key not in output or not isinstance(output[key], kind):
+                raise DoctorError(f"{path} 的 [[outputs]] 第 {index + 1} 项缺少或写错 {key}")
+    return facts
+
+
+class FactsLines:
+    """只为了在漂移报告里给出 facts.toml 的行号。"""
+
+    def __init__(self, path: Path, root: Path):
+        self.path = path
+        self.label = relative(path, root)
+        self.lines = read_text(path).splitlines()
+
+    def _scan(self, section: str, key: str, output: str | None = None) -> int | None:
+        current: str | None = None
+        in_output: str | None = None
+        for index, line in enumerate(self.lines, 1):
+            stripped = line.strip()
+            header = re.match(r"^\[+([^\]]+)\]+$", stripped)
+            if header:
+                current = header.group(1)
+                in_output = None
+                continue
+            if current == "outputs":
+                name = re.match(r'^name\s*=\s*"((?:[^"\\]|\\.)*)"', stripped)
+                if name:
+                    in_output = json.loads(f'"{name.group(1)}"')
+                    continue
+                if (output is None or output == in_output) and re.match(rf"^{re.escape(key)}\s*=", stripped):
+                    return index
+            elif current == section and re.match(rf"^{re.escape(key)}\s*=", stripped):
+                return index
+        return None
+
+    def at(self, section: str, key: str, output: str | None = None) -> str:
+        line = self._scan(section, key, output)
+        return f"{self.label}:{line}" if line else self.label
+
+
+# ---------- README ----------
+
+
+def render_block(facts: dict) -> list[str]:
+    machine = facts["machine"]
+    terminal = facts["terminal"]
+    name = " ".join(part for part in (machine["vendor"], machine["product"]) if part) or "未知"
+    lines = [
+        MARK_BEGIN,
+        f"- 机型 **{name}**，主机名 `{machine['hostname']}`",
+    ]
+    if facts["outputs"]:
+        parts = []
+        for output in facts["outputs"]:
+            x, y = output["position"]
+            make = output["make"] or "未知厂商"
+            parts.append(
+                f"`{output['name']}` **{short_mode(output['current'])}** "
+                f"scale {short_number(output['scale'])}（{make}，位置 x={x} y={y}）"
+            )
+        lines.append("- 显示：" + "；".join(parts))
+    else:
+        lines.append("- 显示：（niri 未报告任何输出）")
+    installed = "、".join(f"`{item}`" for item in terminal["installed"]) or "无"
+    lines.append(f"- 终端 **{terminal['primary'] or '未知'}**（真机已装：{installed}）")
+    lines.append(MARK_END)
+    return lines
+
+
+def write_readme(path: Path, block: list[str]) -> bool:
+    text = read_text(path)
+    lines = text.splitlines()
+    try:
+        begin = lines.index(MARK_BEGIN)
+        end = lines.index(MARK_END)
+    except ValueError:
+        heading = next(
+            (index for index, line in enumerate(lines) if line.strip() == "## 当前环境"),
+            None,
+        )
+        if heading is None:
+            raise DoctorError(f"{path} 里既没有 {MARK_BEGIN}，也没有「## 当前环境」标题")
+        tail = list(lines[heading + 1 :])
+        while tail and not tail[0].strip():
+            tail.pop(0)
+        lines = lines[: heading + 1] + [""] + block + [""] + tail
+    else:
+        if end < begin:
+            raise DoctorError(f"{path} 的 doctor 标记顺序反了")
+        lines = lines[:begin] + block + lines[end + 1 :]
+    new_text = "\n".join(lines).rstrip("\n") + "\n"
+    if new_text == text:
+        return False
+    path.write_text(new_text, encoding="utf-8")
+    return True
+
+
+def parse_readme(path: Path) -> tuple[dict | None, int | None, list[tuple[int, str]]]:
+    """返回 (声明, 起始行, 解析错误)。声明为 None 表示没有标记段。"""
+    lines = read_text(path).splitlines()
+    try:
+        begin = lines.index(MARK_BEGIN)
+        end = lines.index(MARK_END)
+    except ValueError:
+        return None, None, []
+    if end <= begin:
+        return None, begin + 1, []
+    declared: dict = {"outputs": {}, "machine": None, "hostname": None, "terminal": None}
+    errors: list[tuple[int, str]] = []
+    for index in range(begin + 1, end):
+        raw = lines[index]
+        text = raw.strip()
+        if not text:
+            continue
+        lineno = index + 1
+        if text.startswith("- 机型 "):
+            match = re.fullmatch(r"- 机型 \*\*(.+?)\*\*，主机名 `([^`]+)`", text)
+            if not match:
+                errors.append((lineno, text))
+            else:
+                declared["machine"], declared["hostname"] = match.group(1), match.group(2)
+            continue
+        if text.startswith("- 显示："):
+            body = text[len("- 显示：") :]
+            if body == "（niri 未报告任何输出）":
+                continue
+            for segment in body.split("；"):
+                match = re.fullmatch(
+                    r"`([^`]+)` \*\*([^*]+)\*\* scale ([0-9.]+)（([^，]*)"
+                    r"，位置 x=(-?\d+) y=(-?\d+)）",
+                    segment,
+                )
+                if not match:
+                    errors.append((lineno, segment))
+                    continue
+                declared["outputs"][match.group(1)] = {
+                    "mode": match.group(2),
+                    "scale": float(match.group(3)),
+                    "make": match.group(4),
+                    "position": [int(match.group(5)), int(match.group(6))],
+                    "line": lineno,
+                }
+            continue
+        if text.startswith("- 终端 "):
+            match = re.fullmatch(r"- 终端 \*\*(.+?)\*\*（真机已装：.*）", text)
+            if not match:
+                errors.append((lineno, text))
+            else:
+                declared["terminal"] = match.group(1)
+            continue
+        errors.append((lineno, text))
+    return declared, begin + 1, errors
+
+
+# ---------- kanshi ----------
+
+
+TOKEN_RE = re.compile(r'"[^"]*"|[{}]|[^\s{}]+')
+
+
+def parse_kanshi(path: Path) -> list[dict]:
+    entries: list[dict] = []
+    profile: str | None = None
+    output: str | None = None
+    output_line = 0
+    mode: str | None = None
+    mode_line = 0
+    depth = 0
+    for lineno, raw in enumerate(read_text(path).splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        tokens = [(match.group(0), lineno) for match in TOKEN_RE.finditer(line)]
+        index = 0
+        while index < len(tokens):
+            token, line_no = tokens[index]
+            if token == "}":
+                if depth == 2 and output is not None:
+                    entries.append(
+                        {
+                            "profile": profile,
+                            "output": output,
+                            "mode": mode,
+                            "line": mode_line if mode else output_line,
+                            "output_line": output_line,
+                        }
+                    )
+                    output = None
+                    mode = None
+                depth -= 1
+                if depth <= 0:
+                    depth = 0
+                    profile = None
+                index += 1
+                continue
+            if token == "{":
+                depth += 1
+                index += 1
+                continue
+            if token == "profile" and depth == 0 and index + 1 < len(tokens):
+                profile = tokens[index + 1][0]
+                index += 2
+                continue
+            if token == "output" and depth == 1 and profile and index + 1 < len(tokens):
+                output = tokens[index + 1][0]
+                output_line = line_no
+                mode = None
+                index += 2
+                if index < len(tokens) and tokens[index][0] == "disable":
+                    entries.append(
+                        {
+                            "profile": profile,
+                            "output": output,
+                            "mode": None,
+                            "line": line_no,
+                            "output_line": line_no,
+                        }
+                    )
+                    output = None
+                    index += 1
+                elif index < len(tokens) and tokens[index][0] == "{":
+                    depth += 1
+                    index += 1
+                continue
+            if token == "mode" and depth == 2 and output and index + 1 < len(tokens):
+                mode = tokens[index + 1][0]
+                mode_line = line_no
+                index += 2
+                continue
+            index += 1
+    return entries
+
+
+# ---------- 检查 ----------
+
+
+def make_row(name: str, declared: str, actual: str, status) -> tuple[str, str, str, str]:
+    if status is True:
+        verdict = "ok"
+    elif status is False:
+        verdict = "DRIFT"
+    else:
+        verdict = str(status)
+    return name, declared, actual, verdict
+
+
+def check_readme(facts: dict, readme: Path, root: Path) -> list[tuple]:
+    declared, start, errors = parse_readme(readme)
+    label = relative(readme, root)
+    if declared is None:
+        hint = f"{label}:{start}" if start else label
+        return [
+            make_row(
+                f"README 环境段 [{hint}]",
+                "存在 doctor 标记段",
+                "缺失",
+                False,
+            )
+        ]
+    rows: list[tuple] = []
+    for lineno, text in errors:
+        rows.append(make_row(f"README 格式 [{label}:{lineno}]", clip(text), "无法解析", False))
+
+    want_machine = f"{facts['machine']['vendor']} {facts['machine']['product']}".strip()
+    got_machine = declared.get("machine")
+    rows.append(
+        make_row(
+            f"README 机型 [{label}:{start}]",
+            got_machine if got_machine is not None else "缺失",
+            want_machine,
+            got_machine == want_machine,
+        )
+    )
+    rows.append(
+        make_row(
+            f"README 主机名 [{label}:{start}]",
+            declared.get("hostname") if declared.get("hostname") is not None else "缺失",
+            facts["machine"]["hostname"],
+            declared.get("hostname") == facts["machine"]["hostname"],
+        )
+    )
+    rows.append(
+        make_row(
+            f"README 终端 [{label}:{start}]",
+            declared.get("terminal") if declared.get("terminal") is not None else "缺失",
+            facts["terminal"]["primary"],
+            declared.get("terminal") == facts["terminal"]["primary"],
+        )
+    )
+
+    for output in facts["outputs"]:
+        name = output["name"]
+        found = declared["outputs"].get(name)
+        if found is None:
+            rows.append(
+                make_row(
+                    f"README 输出 {name} [{label}]",
+                    "缺失",
+                    f"`{name}` {short_mode(output['current'])}",
+                    False,
+                )
+            )
+            continue
+        where = found["line"]
+        x, y = output["position"]
+        rows += [
+            make_row(
+                f"README {name} 模式 [{label}:{where}]",
+                found["mode"],
+                short_mode(output["current"]),
+                found["mode"] == short_mode(output["current"]),
+            ),
+            make_row(
+                f"README {name} scale [{label}:{where}]",
+                short_number(found["scale"]),
+                short_number(output["scale"]),
+                abs(float(found["scale"]) - float(output["scale"])) < 1e-9,
+            ),
+            make_row(
+                f"README {name} 位置 [{label}:{where}]",
+                f"x={found['position'][0]} y={found['position'][1]}",
+                f"x={x} y={y}",
+                found["position"] == [x, y],
+            ),
+            make_row(
+                f"README {name} 厂商 [{label}:{where}]",
+                found["make"],
+                output["make"] or "未知厂商",
+                found["make"] == (output["make"] or "未知厂商"),
+            ),
+        ]
+    for name in declared["outputs"]:
+        if all(output["name"] != name for output in facts["outputs"]):
+            found = declared["outputs"][name]
+            rows.append(
+                make_row(
+                    f"README 输出 {name} [{label}:{found['line']}]",
+                    f"{name} {found['mode']}",
+                    "真机不存在",
+                    False,
+                )
+            )
+    return rows
+
+
+def check_kanshi(facts: dict, config: Path, root: Path) -> list[tuple]:
+    label = relative(config, root)
+    if not config.is_file():
+        return [make_row(f"kanshi [{label}]", "存在", "缺失", False)]
+    by_name = {output["name"]: output for output in facts["outputs"]}
+    rows: list[tuple] = []
+    for entry in parse_kanshi(config):
+        output = entry["output"]
+        profile = entry["profile"]
+        where = entry["output_line"]
+        if output not in by_name:
+            rows.append(
+                make_row(
+                    f"kanshi {profile} 输出 {output} [{label}:{where}]",
+                    output,
+                    "真机不存在",
+                    False,
+                )
+            )
+        if entry["mode"] is None:
+            continue
+        parts = mode_parts(entry["mode"])
+        if parts is None:
+            rows.append(
+                make_row(
+                    f"kanshi {profile} 模式 {output} [{label}:{entry['line']}]",
+                    entry["mode"],
+                    "无法解析（应为 宽x高@刷新率）",
+                    False,
+                )
+            )
+            continue
+        if output not in by_name:
+            continue
+        available = {mode_parts(mode) for mode in by_name[output]["modes"]}
+        wanted = (parts[0], parts[1], round(parts[2], 3))
+        found = any(item and (item[0], item[1], round(item[2], 3)) == wanted for item in available)
+        rows.append(
+            make_row(
+                f"kanshi {profile} 模式 {output} [{label}:{entry['line']}]",
+                entry["mode"],
+                "在真机可用模式中" if found else "不在真机可用模式中",
+                found,
+            )
+        )
+    return rows
+
+
+def check_manifest(manifest: Path, root: Path) -> list[tuple]:
+    label = relative(manifest, root)
+    if not manifest.is_file():
+        return [make_row(f"MANIFEST [{label}]", "存在", "缺失", False)]
+    total = 0
+    missing: list[tuple[int, str]] = []
+    for lineno, raw in enumerate(read_text(manifest).splitlines(), 1):
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        source = raw.split("\t", 1)[0]
+        total += 1
+        if not (root / source).exists():
+            missing.append((lineno, source))
+    rows = [
+        make_row(
+            f"MANIFEST 源路径 [{label}:{lineno}]",
+            source,
+            "缺失",
+            False,
+        )
+        for lineno, source in missing
+    ]
+    rows.append(
+        make_row(
+            f"MANIFEST 源路径 [{label}]",
+            f"{total} 条",
+            "全部存在" if not missing else f"{len(missing)} 条缺失",
+            not missing,
+        )
+    )
+    return rows
+
+
+def fact_label(lines: FactsLines, section: str, key: str, output: str | None = None) -> str:
+    return lines.at(section, key, output)
+
+
+def check_live(facts: dict, root: Path, facts_path: Path) -> list[tuple]:
+    label = relative(facts_path, root)
+    try:
+        live = collect(root)
+    except DoctorError as exc:
+        return [make_row(f"真机采集 [{label}]", "可读取", str(exc), "SKIP")]
+
+    lines = FactsLines(facts_path, root)
+    rows: list[tuple] = []
+    for key in ("vendor", "product", "hostname"):
+        rows.append(
+            make_row(
+                f"真机 machine.{key} [{fact_label(lines, 'machine', key)}]",
+                facts["machine"][key],
+                live["machine"][key],
+                facts["machine"][key] == live["machine"][key],
+            )
+        )
+    rows.append(
+        make_row(
+            f"真机 terminal.primary [{fact_label(lines, 'terminal', 'primary')}]",
+            facts["terminal"]["primary"],
+            live["terminal"]["primary"],
+            facts["terminal"]["primary"] == live["terminal"]["primary"],
+        )
+    )
+    rows.append(
+        make_row(
+            f"真机 terminal.installed [{fact_label(lines, 'terminal', 'installed')}]",
+            "、".join(facts["terminal"]["installed"]) or "无",
+            "、".join(live["terminal"]["installed"]) or "无",
+            facts["terminal"]["installed"] == live["terminal"]["installed"],
+        )
+    )
+
+    declared = {output["name"]: output for output in facts["outputs"]}
+    actual = {output["name"]: output for output in live["outputs"]}
+    for name in sorted(set(declared) | set(actual), key=str.casefold):
+        if name not in actual:
+            rows.append(
+                make_row(
+                    f"真机输出 {name} [{fact_label(lines, 'outputs', 'name', name)}]",
+                    "存在",
+                    "已消失",
+                    False,
+                )
+            )
+            continue
+        if name not in declared:
+            rows.append(
+                make_row(
+                    f"真机输出 {name} [{label}]",
+                    "未记录",
+                    f"{short_mode(actual[name]['current'])}",
+                    False,
+                )
+            )
+            continue
+        want = declared[name]
+        got = actual[name]
+        fields = (
+            ("current", short_mode(want["current"]), short_mode(got["current"])),
+            ("scale", short_number(want["scale"]), short_number(got["scale"])),
+            ("position", f"x={want['position'][0]} y={want['position'][1]}", f"x={got['position'][0]} y={got['position'][1]}"),
+            ("transform", want["transform"], got["transform"]),
+            ("make", want["make"], got["make"]),
+            ("model", want["model"], got["model"]),
+        )
+        for key, before, after in fields:
+            rows.append(
+                make_row(
+                    f"真机 {name}.{key} [{fact_label(lines, 'outputs', key, name)}]",
+                    before,
+                    after,
+                    before == after,
+                )
+            )
+        same_modes = want["modes"] == got["modes"]
+        if same_modes:
+            detail_want = detail_got = f"{len(want['modes'])} 个"
+        else:
+            extra = [mode for mode in got["modes"] if mode not in want["modes"]]
+            lost = [mode for mode in want["modes"] if mode not in got["modes"]]
+            detail_want = f"{len(want['modes'])} 个" + (f"，少 {short_mode(lost[0])}" if lost else "")
+            detail_got = f"{len(got['modes'])} 个" + (f"，多 {short_mode(extra[0])}" if extra else "")
+        rows.append(
+            make_row(
+                f"真机 {name}.modes [{fact_label(lines, 'outputs', 'modes', name)}]",
+                detail_want,
+                detail_got,
+                same_modes,
+            )
+        )
+    return rows
+
+
+# ---------- 输出 ----------
+
+
+def print_rows(rows: list[tuple[str, str, str, str]]) -> None:
+    headers = ("检查项", "声明值", "实际值", "判定")
+    widths = [display_width(item) for item in headers]
+    clipped = []
+    for row in rows:
+        values = [clip(value) for value in row]
+        clipped.append(values)
+        widths = [max(width, display_width(value)) for width, value in zip(widths, values)]
+    widths = [min(width, 60) for width in widths]
+    print(" | ".join(pad(value, width) for value, width in zip(headers, widths)))
+    print("-+-".join("-" * width for width in widths))
+    for values in clipped:
+        print(" | ".join(pad(value, width) for value, width in zip(values, widths)))
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="doctor",
+        description="对照 doctor/facts.toml、README、kanshi/config、MANIFEST.tsv 与真机状态。",
+    )
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent, help=argparse.SUPPRESS)
+    parser.add_argument("--refresh", action="store_true", help="从真机重采事实并重写 doctor/facts.toml")
+    parser.add_argument("--render", action="store_true", help="按事实重写 README 的 doctor environment 段")
+    args = parser.parse_args(argv)
+
+    root = args.root.resolve()
+    facts_path = root / "doctor/facts.toml"
+    readme = root / "README.md"
+    kanshi = root / "kanshi/config"
+    manifest = root / "MANIFEST.tsv"
+
+    if not (root / "MANIFEST.tsv").exists():
+        raise DoctorError(f"{root} 不像仓库根目录（缺 MANIFEST.tsv）")
+
+    if args.refresh:
+        facts = collect(root)
+        facts_path.parent.mkdir(parents=True, exist_ok=True)
+        new_text = facts_text(facts)
+        changed = not facts_path.exists() or read_text(facts_path) != new_text
+        if changed:
+            facts_path.write_text(new_text, encoding="utf-8")
+        print(
+            f"{relative(facts_path, root)}：{'已更新' if changed else '无变化'}"
+            f"（{len(facts['outputs'])} 个输出，终端 {facts['terminal']['primary'] or '未知'}）"
+        )
+
+    if args.render:
+        facts = load_facts(facts_path)
+        changed = write_readme(readme, render_block(facts))
+        print(f"{relative(readme, root)} 环境段：{'已更新' if changed else '无变化'}")
+
+    if args.refresh or args.render:
+        if args.refresh and args.render:
+            print("提示：再跑 ./doctor/doctor 确认没有剩余漂移")
+        return 0
+
+    facts = load_facts(facts_path)
+    rows: list[tuple] = []
+    rows += check_readme(facts, readme, root)
+    rows += check_kanshi(facts, kanshi, root)
+    rows += check_manifest(manifest, root)
+    rows += check_live(facts, root, facts_path)
+    print_rows(rows)
+
+    drift = sum(1 for row in rows if row[3] == "DRIFT")
+    skipped = sum(1 for row in rows if row[3] == "SKIP")
+    print()
+    print(f"# 检查 {len(rows)} 项：漂移 {drift}，跳过 {skipped}")
+    if drift:
+        print("# README 段可自动更新：./doctor/doctor --render")
+        print("# 事实过期可重采：./doctor/doctor --refresh（改完事实再看 README）")
+        print("# kanshi/config 与 MANIFEST.tsv 由各自维护者处理，doctor 不写入")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except DoctorError as error:
+        print(f"doctor: {error}", file=sys.stderr)
+        sys.exit(2)
