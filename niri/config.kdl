@@ -149,19 +149,69 @@ window-rule {
     clip-to-geometry true
 }
 
+// Manggo 的透明弹窗需要让 niri 只绘制外侧焦点环。
+window-rule {
+    match app-id=r#"^com\.pylogmon\.Manggo$"#
+    draw-border-with-background false
+}
+
+// Manggo 翻译窗四周有 24 逻辑像素的透明留白，向内绘制贴着内容的焦点轮廓。
+window-rule {
+    match app-id=r#"^com\.pylogmon\.Manggo$"# title="^(翻译|Translation)$"
+    max-width 568
+    // GTK 3 浮窗收到平铺状态时，内容变化可能要等失焦才重新调整尺寸。
+    tiled-state false
+    focus-ring { off; }
+    border { off; }
+    geometry-corner-radius 37
+    shadow {
+        on
+        softness 0
+        spread -21
+        offset x=0 y=0
+        draw-behind-window true
+        color "#58a6ff"
+        inactive-color "#010409"
+    }
+}
+
+// 场景切换专用命名工作区（~/.local/bin/scene 按名聚焦；声明过就常驻，空区也在）
+workspace "写作" {
+    open-on-output "HDMI-A-1"
+}
+
+workspace "打题" {
+    open-on-output "HDMI-A-1"
+}
+
 binds {
     Mod+Shift+Slash hotkey-overlay-title="显示重要快捷键" { show-hotkey-overlay; }
 
     // 自定义快捷键
     Mod+E hotkey-overlay-title="文件管理器" { spawn "nautilus"; }
-    // spawn 不走 shell，niri 自己的 PATH 里没有 ~/.local/bin，必须显式展开
-    Mod+Shift+S hotkey-overlay-title="区域截图 → satty 标注" { spawn-sh "exec ~/.local/bin/screenshot-annotate"; }
-    Mod+Shift+O hotkey-overlay-title="区域截图 → OCR 到剪贴板" { spawn-sh "exec ~/.local/bin/ocr-region"; }
-    // Manggo 翻译：包内容解在 ~/opt/manggo，入口是 ~/.local/bin/Manggo（见 local/bin/Manggo）。
-    // Wayland 全局热键由 niri 注册，Manggo 未运行时会自动启动。
-    Mod+A hotkey-overlay-title="选词翻译" { spawn-sh "exec ~/.local/bin/Manggo --action selection-translation"; }
-    Mod+S hotkey-overlay-title="截图翻译" { spawn-sh "exec ~/.local/bin/Manggo --action screenshot-translation"; }
-    Mod+Shift+A hotkey-overlay-title="打开翻译窗口" { spawn-sh "exec ~/.local/bin/Manggo --action input-translation"; }
+    // spawn 不走 shell，niri 自己的 PATH 里没有 ~/.local/bin，必须显式展开；
+    // 截图脚本内部还要调 ~/.local/bin 下的 wl-copy，所以 PATH 也要带上
+    Mod+Shift+S hotkey-overlay-title="区域截图 → satty 标注" { spawn-sh r#"PATH="$HOME/.local/bin:$PATH"; exec ~/.local/bin/screenshot-annotate"#; }
+    Mod+Shift+O hotkey-overlay-title="区域截图 → OCR 到剪贴板" { spawn-sh r#"PATH="$HOME/.local/bin:$PATH"; exec ~/.local/bin/ocr-region"#; }
+    // Manggo 1.3.9 由 pacman 提供（/opt/manggo + /usr/bin/manggo），Wayland 全局热键由 niri 注册。
+    // wl-paste 只装在 ~/.local/bin，这里给绝对路径；没有选中文本时退回 Manggo 自带的选区取词。
+    Mod+A repeat=false hotkey-overlay-title="选词翻译" {
+        spawn-sh r#"
+            if selected=$(/usr/bin/timeout 1s "$HOME/.local/bin/wl-paste" --primary --type text --no-newline 2>/dev/null); then
+                case "$selected" in
+                    *[![:space:]]*)
+                        if /usr/bin/manggo --action input-translation --text "$selected"; then
+                            exit 0
+                        fi
+                        ;;
+                esac
+            fi
+            /usr/bin/sleep 0.15
+            exec /usr/bin/manggo --action selection-translation
+        "#
+    }
+    Mod+S repeat=false hotkey-overlay-title="截图翻译" { spawn-sh r#"PATH="$HOME/.local/bin:$PATH"; exec ~/.local/bin/manggo-screenshot-translate"#; }
+    Mod+Shift+A hotkey-overlay-title="打开翻译窗口" { spawn "manggo" "--action" "input-translation"; }
     Ctrl+Alt+Right hotkey-overlay-title="下一曲" { spawn "noctalia" "msg" "media" "next"; }
     Ctrl+Alt+Left hotkey-overlay-title="上一曲" { spawn "noctalia" "msg" "media" "previous"; }
     Mod+B hotkey-overlay-title="剪贴板" { spawn "noctalia" "msg" "panel-toggle" "clipboard"; }
@@ -320,5 +370,10 @@ binds {
 
     // 只留当前（焦点）显示器；再按一次全部打开。脚本：~/.local/bin/solo-display
     Mod+Shift+M hotkey-overlay-title="只留当前显示器 / 全部打开" { spawn-sh "exec ~/.local/bin/solo-display"; }
+
+    // 场景切换（脚本：~/.local/bin/scene）；同键再按一次 = 退出并还原
+    Mod+Shift+W hotkey-overlay-title="写作模式（再按退出）" { spawn-sh "exec ~/.local/bin/scene write"; }
+    Mod+Shift+D hotkey-overlay-title="演示模式（再按退出）" { spawn-sh "exec ~/.local/bin/scene present"; }
+    Mod+Shift+T hotkey-overlay-title="打题模式（再按退出）" { spawn-sh "exec ~/.local/bin/scene ctf"; }
 }
 include "./noctalia.kdl"
