@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Steam 的 GPU 探测 helper（gldriverquery）在 niri/Xwayland 下会永久挂住：
+#   X Error of failed request: BadValue  (GLX / X_GLXCreateContext)
+# 报错之后不退出，每个卡住的实例各占 100% CPU（load 能到 4+）。
+#
+# LIBGL_ALWAYS_SOFTWARE=1 绕不过去（卡的就是 GLX 建上下文），
+# 把它换成立即退出的 stub 也不行——Steam 启动时会从自己的 depot 把二进制还原回去。
+# 所以这里只做一件事：盯着它，活过 MAX_AGE 秒的实例直接 kill。
+#
+#   steam-gldriverquery-guard            # 前台循环（systemd 单元用的就是这个）
+#   steam-gldriverquery-guard once       # 扫一遍就退出
+#   steam-gldriverquery-guard status     # 看当前实例
+#
+# MAX_AGE（默认 10 秒）、INTERVAL（默认 10 秒）可用环境变量覆盖。
+set -uo pipefail
+
+max_age="${MAX_AGE:-10}"
+interval="${INTERVAL:-10}"
+
+sweep() {
+  local pid age killed=0
+  for pid in $(ps -o pid= -C gldriverquery 2>/dev/null); do
+    age=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+    [ -n "$age" ] || continue
+    if [ "$age" -ge "$max_age" ]; then
+      kill "$pid" 2>/dev/null && killed=$((killed + 1))
+    fi
+  done
+  [ "$killed" -gt 0 ] && echo "$(date +%H:%M:%S) 清掉 $killed 个超时 gldriverquery"
+  return 0
+}
+
+case "${1:-guard}" in
+  guard)
+    echo "开始盯 gldriverquery：超过 ${max_age}s 未退出就 kill，每 ${interval}s 扫一次"
+    while :; do sweep; sleep "$interval"; done
+    ;;
+  once) sweep ;;
+  status)
+    ps -o pid=,pcpu=,etimes=,args= -C gldriverquery 2>/dev/null | cut -c1-120 ||
+      echo "没有 gldriverquery 在跑"
+    ;;
+  *)
+    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+    exit 2
+    ;;
+esac

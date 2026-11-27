@@ -251,6 +251,29 @@ zsh 补全在 `local/completions/_ctfrun`（两个脚本共用，靠 `#compdef c
 
 `systemd/user/hermes-gateway.service` 与 `.d/` 的四个 drop-in 均由 MANIFEST 管理：launch.conf 使用 `/usr/bin/hermes` wrapper，proxy.conf 配置 7897 代理，computer-use-wayland.conf 启用 Wayland，override.conf 保留 `OOMPolicy=continue`。
 
+## Steam（niri / Xwayland）
+
+Steam 在这台机器上有两个独立毛病，都有现成脚本：
+
+1. **启动死锁**：launcher 先建 `~/.steam/steam.pipe`、再 re-exec 自己，新实例只要能打开 pipe 就判定"已有实例"，把命令行转发给已经卡死的进程然后退出。表现是点图标没反应。
+   `local/bin/steam-fix`：清掉卡死的 launcher/UI → 删 `steam.pid`/`steam.pipe`/ValveIPC 共享内存 → `mkfifo steam.pipe && chmod 000`（launcher 打不开就不会误判）→ `LIBGL_ALWAYS_SOFTWARE=1` 启动 `steamrt64/steam -cef-disable-gpu`。
+
+2. **`gldriverquery` 挂死烧 CPU**：Xwayland 下 GLX 建上下文失败
+   ```
+   X Error of failed request: BadValue   (GLX, X_GLXCreateContext)
+   ```
+   报完不退出，每个实例各占 100% CPU（实测三个实例把 load 顶到 4.3）。`LIBGL_ALWAYS_SOFTWARE=1` 绕不过去，因为卡的就是 GLX 那一步；把二进制换成立即退出的 stub 也不行——Steam 启动时会从自己的 depot 把 `ubuntu12_32/64/gldriverquery` 还原回去。
+   最终做法是看门狗：`local/bin/steam-gldriverquery-guard`（活过 10 秒的实例直接 kill，每 10 秒扫一次）+ `systemd/user/steam-gldriverquery-guard.service`（随 `graphical-session.target` 启动，`Restart=always`）。
+
+```shell
+./install.sh --apply                      # 装脚本与单元
+systemctl --user enable --now steam-gldriverquery-guard.service
+systemctl --user status steam-gldriverquery-guard.service
+~/.local/bin/steam-gldriverquery-guard status   # 当前有没有卡住的实例
+```
+
+Steam 自己更新后 `gldriverquery` 会被替换，但看门狗只按进程名匹配，不受影响。游戏（Proton/DXVK 走 Vulkan）不受这个 helper 影响。
+
 ## Manggo（翻译 / 截图 OCR）
 
 AUR `manggo`（proprietary，1.2.2-2）。本机**不走 pacman 安装**：按 AUR 的 PKGBUILD 打包后把内容解到 `~/opt/manggo`，入口是包装器 `~/.local/bin/Manggo`。

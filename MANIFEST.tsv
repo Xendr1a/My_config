@@ -42,6 +42,9 @@ local/bin/screenshot-annotate	~/.local/bin/screenshot-annotate	user	区域截图
 local/bin/ocr-region	~/.local/bin/ocr-region	user	区域截图 OCR（chi_sim+eng）到剪贴板
 local/bin/solo-display	~/.local/bin/solo-display	user	只留焦点显示器 / 全部打开（toggle，依赖 jq）
 local/bin/Manggo	~/.local/bin/Manggo	user	Manggo 包装器：包内容解在 ~/opt/manggo，参数透传给 bin/Manggo
+local/bin/steam-fix	~/.local/bin/steam-fix	user	Steam 启动修复：清 pipe 死锁 + 软件渲染跑 UI（niri/Xwayland）
+local/bin/steam-gldriverquery-guard	~/.local/bin/steam-gldriverquery-guard	user	清掉卡死烧 CPU 的 gldriverquery（看门狗前台循环）
+systemd/user/steam-gldriverquery-guard.service	~/.config/systemd/user/steam-gldriverquery-guard.service	user	上面那个看门狗随图形会话启动
 micmute-led/micmute-led-sync.sh	~/.local/bin/micmute-led-sync.sh	user	麦克风静音 LED 同步脚本
 micmute-led/micmute-led-sync.service	~/.config/systemd/user/micmute-led-sync.service	user	对应 user 服务
 systemd/user/kanshi.service	~/.config/systemd/user/kanshi.service	user	kanshi 随图形会话启动

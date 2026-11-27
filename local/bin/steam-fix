@@ -1,0 +1,43 @@
+#!/bin/sh
+# Steam 启动修复 (niri/Xwayland + NVIDIA)
+#
+# 症状: 点 Steam 图标无反应 / 窗口闪一下就没了 / 日志刷
+#   Steam is already running, exiting (command line was forwarded)
+#   SteamUpdateUI: An X Error occurred / BadValue
+#   glXCreateContext failed -> src/surface_opengl.cpp (631): glIsTexture(id)==GL_TRUE
+#
+# 原因:
+#  1) launcher 先建 ~/.steam/steam.pipe 再 re-exec 自己，新实例看到 pipe 可打开
+#     就判定「已有实例」，把命令行转发给一个已经卡死的进程后退出（死锁）。
+#  2) Xwayland 下 NVIDIA GLX 无法 create context (BadValue)，Steam 的 UI surface
+#     断言失败崩溃。退回 Mesa llvmpipe 可正常渲染（仅 Steam UI，游戏走 Vulkan 不受影响）。
+
+SROOT="${HOME}/.local/share/Steam"
+
+# 如果已经有健康的客户端在跑（steamwebhelper 存在），直接转发命令行即可
+if pgrep -f "steamrt64/steamwebhelper" >/dev/null 2>&1; then
+    exec "$SROOT/steamrt64/steam" "$@"
+fi
+
+# 清理卡死的 launcher / 更新 UI 子进程
+for p in $(pgrep -f "steamrt64/steam|steamwebhelper" 2>/dev/null); do
+    [ "$p" = "$$" ] && continue
+    kill -CONT "$p" 2>/dev/null || true
+    kill -9 "$p" 2>/dev/null || true
+done
+sleep 1
+
+rm -f "${HOME}/.steam/steam.pid" "${HOME}/.steam/steam.pipe" \
+      /dev/shm/u1000-ValveIPCSharedObj-Steam
+rm -f /tmp/steam_chrome_shmem_uid"$(id -u)"_spid* 2>/dev/null
+
+# 预占 FIFO 并去掉权限: launcher 打不开它 => 不会误判「已在运行」
+if [ ! -p "${HOME}/.steam/steam.pipe" ]; then
+    mkfifo "${HOME}/.steam/steam.pipe"
+fi
+chmod 000 "${HOME}/.steam/steam.pipe"
+
+# Xwayland 下 NVIDIA GLX badvalue -> 用 Mesa 软件渲染跑 Steam UI
+export LIBGL_ALWAYS_SOFTWARE=1
+
+exec "$SROOT/steamrt64/steam" -cef-disable-gpu "$@"
