@@ -313,3 +313,44 @@ git_before=$(git -C "$ROOT" status --porcelain)
 [[ "$(git -C "$ROOT" status --porcelain)" == "$git_before" ]] || fail '默认运行弄脏了 git status'
 [[ $(wc -l <"$tmp/state-ro/doctor.log") -eq 1 ]] || fail '默认运行应写一条状态日志'
 pass '默认运行只读仓库，状态只落用户目录'
+
+# 探测空值 ≠ 漂移：假 fc-match 不输出任何 family。
+mkdir -p "$tmp/fakebin-empty" "$tmp/fakebin-drift"
+cat >"$tmp/fakebin-empty/fc-match" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+cat >"$tmp/fakebin-drift/fc-match" <<'SH'
+#!/usr/bin/env bash
+printf 'Totally Different Font'
+SH
+chmod +x "$tmp/fakebin-empty/fc-match" "$tmp/fakebin-drift/fc-match"
+
+rm -rf "$tmp/state-fc-empty"
+if ! PATH="$tmp/fakebin-empty:$PATH" "$doctor" --root "$tmp" --state-dir "$tmp/state-fc-empty" >"$tmp/out" 2>&1; then
+  fail 'fc-match 空输出应退出 0' "$(cat "$tmp/out")"
+fi
+grep -q '真机 fontconfig.monospace_cjk.*SKIP' "$tmp/out" || fail '空 fc-match 记 SKIP' "$(cat "$tmp/out")"
+grep -q '真机 fontconfig.sans_serif_cjk.*SKIP' "$tmp/out" || fail '空 fc-match（sans）记 SKIP' "$(cat "$tmp/out")"
+PATH="$tmp/fakebin-empty:$PATH" "$doctor" --root "$tmp" --state-dir "$tmp/state-fc-empty" --json >"$tmp/json" 2>&1 ||
+  fail 'fc-match 空输出时 --json 应退出 0'
+python3 - "$tmp/json" <<'PY' || fail '空探测应进 skipped 且 drift 0'
+import json, sys
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+raise SystemExit(0 if obj["drift"] == 0 and obj["exit"] == 0 and obj["skipped"] >= 2 else 1)
+PY
+pass '探测空值记 SKIP，不参与退出码'
+
+rm -rf "$tmp/state-fc-drift"
+if PATH="$tmp/fakebin-drift:$PATH" "$doctor" --root "$tmp" --state-dir "$tmp/state-fc-drift" >"$tmp/out" 2>&1; then
+  fail 'fc-match 不一致值应退出 1' "$(cat "$tmp/out")"
+fi
+grep -q '真机 fontconfig.monospace_cjk.*DRIFT' "$tmp/out" || fail '真实不一致值记 DRIFT' "$(cat "$tmp/out")"
+PATH="$tmp/fakebin-drift:$PATH" "$doctor" --root "$tmp" --state-dir "$tmp/state-fc-drift" --json >"$tmp/json" 2>&1 || true
+python3 - "$tmp/json" <<'PY' || fail '真实不一致值应进 added'
+import json, sys
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+ids = {item["id"] for item in obj["added"]}
+raise SystemExit(0 if obj["exit"] == 1 and "真机 fontconfig.monospace_cjk" in ids else 1)
+PY
+pass '探测到真实不一致值仍是 DRIFT'

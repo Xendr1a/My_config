@@ -51,6 +51,7 @@
 - niri 命名工作区与 `~/.local/bin/scene` 三个键位、kanshi profile 对当前输出的适配（kanshi 没启用也照常判定）。
 - fontconfig 实际中文解析结果、fcitx5 profile 默认输入法（当前激活输入法随焦点变化，只提示不判定）。
 - README 的 `doctor:begin/end environment` 段由同一份 facts 渲染。
+- 真机探测失败（命令不可用、超时、空输出）一律记 `SKIP` 并进 `skipped`，不参与退出码；只有拿到真实值且与 facts 不符才算 `DRIFT`。避免 service/缓存冷启动时把探测空值误报成新增漂移。
 
 夜间光 / 色温没有查询接口，doctor 不采集。`niri/outputs.kdl` 是 Noctalia 面板维护的单向文件（实机为准），doctor 只沿用 check-sync 的 `state` 语义记录差异，不做仓库↔实机双向判定。
 
@@ -98,8 +99,9 @@ systemctl --user daemon-reload && systemctl --user enable --now doctor-daily.tim
 ```
 
 `doctor-daily.timer` 用 `OnCalendar=*-*-* 07:00:00` + `Persistent=true`（关机错过则开机补跑）；
-service 的 `ExecStart` 固定为本机仓库 `/home/xendr1a/system/My_config-x/doctor/doctor --summary`，
-仓库换位置时先改 service。输出进 journal，`doctor.log` 由 doctor 自己写，单元不重复重定向。
+service 固定 `WorkingDirectory=/home/xendr1a/system/My_config-x`、`Environment=LANG=C.UTF-8`，
+`ExecStart` 用绝对路径 `/home/xendr1a/system/My_config-x/doctor/doctor --summary`；仓库换位置时
+这三处一起改。输出进 journal，`doctor.log` 由 doctor 自己写，单元不重复重定向。
 
 ## 键位速查
 

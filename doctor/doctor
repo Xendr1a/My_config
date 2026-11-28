@@ -313,7 +313,11 @@ def collect_fontconfig() -> dict:
         return {"available": False, "monospace_cjk": "", "sans_serif_cjk": ""}
 
     def family(pattern: str) -> str:
-        proc = run(["fc-match", "-f", "%{family[0]}", pattern])
+        # 探测失败（超时/执行错误/空输出）返回空串，由 check_host 记 SKIP。
+        try:
+            proc = run(["fc-match", "-f", "%{family[0]}", pattern])
+        except DoctorError:
+            return ""
         return proc.stdout.strip() if proc.returncode == 0 else ""
 
     return {
@@ -327,7 +331,11 @@ def profile_default_im() -> str:
     path = Path.home() / ".config/fcitx5/profile"
     if not path.is_file():
         return ""
-    for line in read_text(path).splitlines():
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    for line in text.splitlines():
         if line.startswith("DefaultIM="):
             return line.split("=", 1)[1].strip()
     return ""
@@ -1340,6 +1348,13 @@ def check_readme(facts: dict, readme: Path, root: Path) -> list[tuple]:
     return rows
 
 
+def probe_row(name: str, declared: str, actual: str, reason: str) -> tuple[str, str, str, str]:
+    """探测为空/失败时记 SKIP，只有拿到真实值才和 facts 比较。"""
+    if not actual:
+        return make_row(name, declared, reason, "SKIP")
+    return make_row(name, declared, actual, declared == actual)
+
+
 def check_host(facts: dict, live: dict, errors: list[str], facts_path: Path, root: Path) -> list[tuple]:
     label = relative(facts_path, root)
     lines = FactsLines(facts_path, root)
@@ -1349,27 +1364,28 @@ def check_host(facts: dict, live: dict, errors: list[str], facts_path: Path, roo
 
     for key in ("vendor", "product", "hostname"):
         rows.append(
-            make_row(
+            probe_row(
                 f"真机 machine.{key} [{lines.at('machine', key)}]",
                 facts["machine"][key],
                 live["machine"][key],
-                facts["machine"][key] == live["machine"][key],
+                "DMI/主机名未返回值（探测失败）",
             )
         )
     rows.append(
-        make_row(
+        probe_row(
             f"真机 terminal.primary [{lines.at('terminal', 'primary')}]",
             facts["terminal"]["primary"],
             live["terminal"]["primary"],
-            facts["terminal"]["primary"] == live["terminal"]["primary"],
+            "niri 配置不可读或未匹配到已装终端（探测失败）",
         )
     )
+    actual_terminals = "、".join(live["terminal"]["installed"])
     rows.append(
-        make_row(
+        probe_row(
             f"真机 terminal.installed [{lines.at('terminal', 'installed')}]",
             "、".join(facts["terminal"]["installed"]) or "无",
-            "、".join(live["terminal"]["installed"]) or "无",
-            facts["terminal"]["installed"] == live["terminal"]["installed"],
+            actual_terminals or ("无" if not facts["terminal"]["installed"] else ""),
+            "PATH 内没有可识别的终端（探测失败）",
         )
     )
 
@@ -1426,24 +1442,34 @@ def check_host(facts: dict, live: dict, errors: list[str], facts_path: Path, roo
         )
         for key, before, after in fields:
             rows.append(
-                make_row(
+                probe_row(
                     f"真机 {name}.{key} [{lines.at('outputs', key, name)}]",
                     before,
                     after,
-                    before == after,
+                    "niri 未返回该字段（探测失败）",
                 )
             )
 
     want_backlight = facts["brightness"]
     got_backlight = live["brightness"]
-    rows.append(
-        make_row(
-            f"真机 背光设备 [{lines.at('brightness', 'internal')}]",
-            want_backlight["internal"] or "无",
-            got_backlight["internal"] or "无",
-            want_backlight["internal"] == got_backlight["internal"],
+    if want_backlight["internal"] and not got_backlight["internal"]:
+        rows.append(
+            make_row(
+                f"真机 背光设备 [{lines.at('brightness', 'internal')}]",
+                want_backlight["internal"],
+                "未读到背光设备（探测失败）",
+                "SKIP",
+            )
         )
-    )
+    else:
+        rows.append(
+            make_row(
+                f"真机 背光设备 [{lines.at('brightness', 'internal')}]",
+                want_backlight["internal"] or "无",
+                got_backlight["internal"] or "无",
+                want_backlight["internal"] == got_backlight["internal"],
+            )
+        )
 
     ddc = live["ddc"]
     if not want_backlight["external_connector"]:
@@ -1476,9 +1502,9 @@ def check_host(facts: dict, live: dict, errors: list[str], facts_path: Path, roo
                 (
                     f"{match['connector']} 可读（{match['current']}/{match['max']}）"
                     if match
-                    else "无对应显示器"
+                    else "ddcutil 未返回该连接器 VCP（探测失败）"
                 ),
-                match is not None,
+                "ok" if match is not None else "SKIP",
             )
         )
 
@@ -1517,29 +1543,26 @@ def check_host(facts: dict, live: dict, errors: list[str], facts_path: Path, roo
         )
 
     fontconfig = live["fontconfig"]
-    if not fontconfig["available"]:
-        rows.append(make_row(f"真机 fontconfig [{lines.at('fontconfig', 'monospace_cjk')}]", "fc-match 可用", "缺失", "SKIP"))
-    else:
-        for key in ("monospace_cjk", "sans_serif_cjk"):
-            rows.append(
-                make_row(
-                    f"真机 fontconfig.{key} [{lines.at('fontconfig', key)}]",
-                    facts["fontconfig"][key],
-                    fontconfig[key],
-                    facts["fontconfig"][key] == fontconfig[key],
-                )
+    for key in ("monospace_cjk", "sans_serif_cjk"):
+        rows.append(
+            probe_row(
+                f"真机 fontconfig.{key} [{lines.at('fontconfig', key)}]",
+                facts["fontconfig"][key],
+                fontconfig.get(key, "") if fontconfig["available"] else "",
+                "fc-match 不可用或未返回值（探测失败）",
             )
+        )
 
     fcitx5 = live["fcitx5"]
     if not fcitx5["available"]:
         rows.append(make_row(f"真机 fcitx5 [{lines.at('fcitx5', 'default_im')}]", "可查询", "未运行且无 profile", "SKIP"))
     else:
         rows.append(
-            make_row(
+            probe_row(
                 f"真机 fcitx5 默认输入法 [{lines.at('fcitx5', 'default_im')}]",
                 facts["fcitx5"]["default_im"],
-                fcitx5["profile_im"] or fcitx5["default_im"] or "未知",
-                facts["fcitx5"]["default_im"] == (fcitx5["profile_im"] or fcitx5["default_im"]),
+                fcitx5["profile_im"] or fcitx5["default_im"],
+                "fcitx5 未返回输入法（探测失败）",
             )
         )
     # 激活输入法随焦点变化，只提示；行始终存在，保证检查总数（items）稳定。
