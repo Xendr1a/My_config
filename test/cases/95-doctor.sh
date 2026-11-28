@@ -354,3 +354,43 @@ ids = {item["id"] for item in obj["added"]}
 raise SystemExit(0 if obj["exit"] == 1 and "真机 fontconfig.monospace_cjk" in ids else 1)
 PY
 pass '探测到真实不一致值仍是 DRIFT'
+
+# ---------- --state-dir 隔离：探针不污染生产状态 ----------
+# 生产路径用临时 HOME 模拟，真实 ~/.local/state/doctor/ 全程不参与。
+probe_home="$tmp/home-probe"
+probe_prod="$probe_home/.local/state/doctor"
+mkdir -p -- "$probe_prod"
+snapshot_state() {
+  (cd -- "$1" && stat -c '%n %s %y %i' -- . * && sha256sum -- *)
+}
+
+# 不传 --state-dir 时落到 $HOME 下的生产路径（此处即临时 HOME，不是真机）。
+HOME="$probe_home" "$doctor" --root "$tmp" >"$tmp/out" 2>&1 || true
+[[ -f "$probe_prod/last.json" && -f "$probe_prod/doctor.log" ]] ||
+  fail '默认状态目录应位于 $HOME/.local/state/doctor' "$(cat "$tmp/out")"
+prod_before=$(snapshot_state "$probe_prod")
+
+# 临时 HOME 没有真机的 niri / scene 配置，退出码可能非零；这里只看状态落盘位置。
+probe_state="$tmp/state-probe"
+rm -rf -- "$probe_state"
+HOME="$probe_home" "$doctor" --root "$tmp" --state-dir "$probe_state" --summary >"$tmp/sum" 2>&1 || true
+assert_file "$probe_state/last.json" '--state-dir 写 last.json'
+assert_file "$probe_state/doctor.log" '--state-dir 写 doctor.log'
+[[ $(wc -l <"$probe_state/doctor.log") -eq 1 ]] ||
+  fail '--state-dir 首跑写一行日志' "$(cat "$probe_state/doctor.log")"
+inode1=$(stat -c %i "$probe_state/last.json")
+HOME="$probe_home" "$doctor" --root "$tmp" --state-dir "$probe_state" --summary >"$tmp/sum" 2>&1 || true
+inode2=$(stat -c %i "$probe_state/last.json")
+[[ "$inode1" != "$inode2" ]] || fail '--state-dir 下 last.json 应被原子覆盖'
+[[ $(wc -l <"$probe_state/doctor.log") -eq 2 ]] ||
+  fail '--state-dir 下 doctor.log 应追加' "$(cat "$probe_state/doctor.log")"
+python3 - "$probe_state" <<'PY' || fail 'last.json 应为最后一行日志'
+import json, pathlib, sys
+state = pathlib.Path(sys.argv[1])
+lines = state.joinpath("doctor.log").read_text(encoding="utf-8").splitlines()
+last = json.loads(state.joinpath("last.json").read_text(encoding="utf-8"))
+raise SystemExit(0 if len(lines) == 2 and json.loads(lines[-1]) == last else 1)
+PY
+[[ "$(snapshot_state "$probe_prod")" == "$prod_before" ]] ||
+  fail '--state-dir 运行改动了生产状态目录' "$(snapshot_state "$probe_prod")"
+pass '--state-dir 状态只落指定目录，生产目录内容与 mtime 不变'

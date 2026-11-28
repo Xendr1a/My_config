@@ -77,6 +77,10 @@ doctor 只读 niri、kanshi、alacritty、noctalia 的配置，不会为了变�
 `doctor.log` 是追加的 JSONL（同一 schema）。`--accept` / `--refresh` / `--render`
 沿用原来的写模式，不写这两个状态文件。
 
+真机探针（假 `fc-match`、临时改 `PATH`、人为造漂移）必须带
+`--state-dir /tmp/doctor-probe`，状态只落该目录；生产路径就是
+`~/.local/state/doctor/`，晨报消费方读它，别拿它试。
+
 - `--summary`：汇总行固定为
   `配置漂移: 漂移 N · baseline N · known N · 昨日新增 N · 最近变更 <无|漂移条目>`；
   有新增时从第二行起列 `+ <id>（<值变|新增>）`，最多 5 条，多则 `+ 还有 N 条`。
