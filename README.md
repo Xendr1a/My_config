@@ -394,3 +394,19 @@ Manggo 自己的设置（翻译服务、OCR 服务、语言偏好）在它 GUI �
 - `wl-clipboard`：本机不是 pacman 包，是解包到 `~/opt/wl-clipboard` 并软链到 `~/.local/bin`
 - Manggo 已装成 `~/opt/manggo` + `~/.local/bin/Manggo` 包装器（见上一节），三个翻译键位已启用
 - nvim 插件锁版本留的是本机已装的旧版（上游把 `lazy-lock.json` 整体往前推了一版），要跟上用 `:Lazy update`
+
+## 娱乐小工具（五个独立仓库）
+
+这几个不是本仓库的文件，而是各自独立的公开仓库；装法是跑各自仓库的 `install.sh`，它会在 `~/.zshrc` 里写一个受管区块，`install.sh --uninstall` 会逐字节还原。重装机器时按顺序执行即可：
+
+| 仓库 | 装完的效果 | 安装 |
+|---|---|---|
+| [keyboard-blindbox](https://github.com/Xendr1a/keyboard-blindbox) | 每 N 次 Enter 掉一句名言（带 mood emoji） | `bash install.sh` |
+| [terminal-fortune](https://github.com/Xendr1a/terminal-fortune) | 新开 shell 一句安慰/嘲讽，配色随情绪 | `bash install.sh` |
+| [terminal-color-egg](https://github.com/Xendr1a/terminal-color-egg) | `ls` 偶尔彩虹文件名（5%，`--always` 强制） | `bash install.sh` |
+| [commit-bgm](https://github.com/Xendr1a/commit-bgm) | `git commit` 成功放 fanfare、失败放 sad trombone | `bash install.sh` |
+| [readme-like-counter](https://github.com/Xendr1a/readme-like-counter) | 仓库每次 push 让 README 的「被 push 了 N 次」+1 | fork 后开 Actions |
+
+- 四个 shell 件共用 `~/.zshrc` 的受管区块，互不覆盖；卸载顺序随意
+- `commit-bgm` 也可改用 `install.sh --hook`（写 `.git/hooks/post-commit`，链式保留既有 hook）
+- **探针/调试注意**：这些脚本装完即生效，调试时请用自己的临时 HOME，别直接改 `~/.zshrc`
