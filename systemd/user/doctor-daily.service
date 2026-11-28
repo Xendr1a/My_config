@@ -3,4 +3,6 @@ Description=doctor 每日巡检（漂移 / baseline / 晨报摘要）
 
 [Service]
 Type=oneshot
+WorkingDirectory=/home/xendr1a/system/My_config-x
+Environment=LANG=C.UTF-8
 ExecStart=/home/xendr1a/system/My_config-x/doctor/doctor --summary
