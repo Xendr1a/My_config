@@ -60,11 +60,44 @@
 ./doctor/doctor --refresh           # 从 DMI、niri、backlight、ddcutil、fc-match、fcitx5、已装终端重采事实
 ./doctor/doctor --render            # 按事实重写 README 环境段
 ./doctor/doctor --refresh --render  # 硬件或布局变了以后一次改完
+./doctor/doctor --summary           # 单行晨报；有新增时附最多 5 条明细
+./doctor/doctor --json              # 同一次检查的稳定 JSON
+./doctor/doctor --since 24h         # 从 doctor.log 汇总窗口内的新增 / 修复
 ```
 
 `--accept` 只在人工确认“这些漂移现在可以接受”时用：它按当前 `DRIFT` 重写整个 baseline（按 id 排序，保留已有 `reason`）。之后命中且观测值一致的项显示 `BASELINED`；新增漂移、baseline 观测值变化都返回非零。baseline 里有、当前已不漂移的项显示 `INFO 已修复，可 --accept 收紧基线`，但不会自动删除。
 
 doctor 只读 niri、kanshi、alacritty、noctalia 的配置，不会为了变绿去改它们；kanshi、check-sync 报出的真实差异交回各自维护者。
+
+### 每日巡检与晨报
+
+每次完整检查（默认、`--summary`、`--json`）都只读仓库，同时把状态写到
+`~/.local/state/doctor/`：`last.json` 是最近一次结果（tmp + rename 原子覆盖），
+`doctor.log` 是追加的 JSONL（同一 schema）。`--accept` / `--refresh` / `--render`
+沿用原来的写模式，不写这两个状态文件。
+
+- `--summary`：汇总行固定为
+  `doctor: 漂移 N · baseline N · known N · 昨日新增 N · 最近变更 <无|文件列表>`；
+  有新增时从第二行起列 `+ <id>（<值变|新增>）`，最多 5 条，多则 `+ 还有 N 条`。
+  「昨日新增」是 `doctor.log` 近 24h 的去重新增 id 数；「最近变更」是近 24h git 提交
+  涉及的文件（没有则 `无`）。
+- `--json`：单个对象，字段顺序固定为
+  `ts, checks, drift, baselined, known, skipped, exit, added[{id,detail,kind}], fixed[{id}], duration_ms`。
+- `--since`：接受 `24h`（也支持 `30m` / `2d` 这类写法）、`yesterday`、`today`、
+  `YYYY-MM-DD`、`YYYY-MM-DDTHH:MM`；窗口内无变化打印 `无变化`，否则每行
+  `<时间> <+/-> <id> <detail>`（同一 id 的同向事件只留最后一次）。
+
+systemd user timer（手动安装，doctor 和 `install.sh` 都不会偷偷改 systemd）：
+
+```shell
+install -Dm644 systemd/user/doctor-daily.service ~/.config/systemd/user/doctor-daily.service
+install -Dm644 systemd/user/doctor-daily.timer ~/.config/systemd/user/doctor-daily.timer
+systemctl --user daemon-reload && systemctl --user enable --now doctor-daily.timer
+```
+
+`doctor-daily.timer` 用 `OnCalendar=*-*-* 07:00:00` + `Persistent=true`（关机错过则开机补跑）；
+service 的 `ExecStart` 固定为本机仓库 `/home/xendr1a/system/My_config-x/doctor/doctor --summary`，
+仓库换位置时先改 service。输出进 journal，`doctor.log` 由 doctor 自己写，单元不重复重定向。
 
 ## 键位速查
 

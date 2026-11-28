@@ -1,0 +1,9 @@
+[Unit]
+Description=每天 07:00 运行 doctor 巡检（关机错过则开机补跑）
+
+[Timer]
+OnCalendar=*-*-* 07:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
