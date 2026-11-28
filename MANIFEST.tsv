@@ -66,3 +66,5 @@ system-files/etc/udev/rules.d/50-nuphy.rules	/etc/udev/rules.d/50-nuphy.rules	ro
 system-files/etc/udev/rules.d/50-vgn-mouse.rules	/etc/udev/rules.d/50-vgn-mouse.rules	root	VGN 鼠标 hidraw 权限
 system-files/etc/udev/hwdb.d/61-battery-local.hwdb	/etc/udev/hwdb.d/61-battery-local.hwdb	root	upower 充电阈值 45/80（BAT0）
 system-files/usr/local/sbin/kvm-nat-bypass-routes.sh	/usr/local/sbin/kvm-nat-bypass-routes.sh	root	上面那个 service 的脚本
+systemd/user/doctor-daily.service	~/.config/systemd/user/doctor-daily.service	user	doctor 每日巡检（oneshot，读真机写 ~/.local/state/doctor/）
+systemd/user/doctor-daily.timer	~/.config/systemd/user/doctor-daily.timer	user	每天 07:00 触发上面那个 service（Persistent 补跑）
