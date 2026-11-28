@@ -22,6 +22,13 @@ baseline 观测值变化才非零退出。`--accept` 按当前漂移重写 basel
   ./doctor/doctor --render        按事实重写 README 环境段
   ./doctor/doctor --accept        把当前漂移写进 doctor/baseline.toml
   ./doctor/doctor --refresh --render
+  ./doctor/doctor --summary       单行晨报（默认检查 + 落状态）
+  ./doctor/doctor --json          同一次检查的稳定 JSON
+  ./doctor/doctor --since 24h     从 doctor.log 汇总窗口内的新增/修复
+
+每次完整检查（默认 / --summary / --json）都会原子覆盖
+~/.local/state/doctor/last.json，并向 ~/.local/state/doctor/doctor.log
+追加一行 JSONL；仓库文件不会被写。
 """
 
 from __future__ import annotations
@@ -35,7 +42,10 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
+import time
 import tomllib
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 MARK_BEGIN = "<!-- doctor:begin environment -->"
@@ -1532,15 +1542,15 @@ def check_host(facts: dict, live: dict, errors: list[str], facts_path: Path, roo
                 facts["fcitx5"]["default_im"] == (fcitx5["profile_im"] or fcitx5["default_im"]),
             )
         )
-        if fcitx5["running_im"]:
-            rows.append(
-                make_row(
-                    "真机 fcitx5 当前激活输入法",
-                    "随焦点变化，不作基线",
-                    fcitx5["running_im"],
-                    "INFO",
-                )
-            )
+    # 激活输入法随焦点变化，只提示；行始终存在，保证检查总数（items）稳定。
+    rows.append(
+        make_row(
+            "真机 fcitx5 当前激活输入法",
+            "随焦点变化，不作基线",
+            fcitx5["running_im"] or "无",
+            "INFO",
+        )
+    )
     return rows
 
 
@@ -1571,7 +1581,214 @@ def print_rows(rows: list[tuple[str, str, str, str]]) -> None:
         print(" | ".join(pad(value, width) for value, width in zip(values, widths)))
 
 
+# ---------- 巡检状态 / 晨报 ----------
+
+
+FIXED_PREFIX = "baseline 已修复 "
+SUMMARY_ADDED_MAX = 5
+SINCE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+SINCE_RE = re.compile(r"^(\d+)([smhd])$")
+SINCE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def default_state_dir() -> Path:
+    return Path.home() / ".local/state/doctor"
+
+
+def report_dict(rows: list[tuple[str, str, str, str]], duration_ms: int) -> dict:
+    added: list[dict] = []
+    fixed: list[dict] = []
+    baselined = known = skipped = 0
+    for name, declared, actual, status in rows:
+        if status.startswith("DRIFT"):
+            added.append(
+                {
+                    "id": stable_id(name),
+                    "detail": observation_detail((name, declared, actual, status)),
+                    "kind": "new" if status == "DRIFT" else "value_changed",
+                }
+            )
+        elif name.startswith(FIXED_PREFIX):
+            fixed.append({"id": name[len(FIXED_PREFIX) :]})
+        if status == "BASELINED":
+            baselined += 1
+        elif status == "KNOWN":
+            known += 1
+        elif status == "SKIP":
+            skipped += 1
+    report = {
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "schema": 1,
+        "checks": len(rows),
+        "items": len(rows),
+        "drift": len(added),
+        "baselined": baselined,
+        "known": known,
+        "skipped": skipped,
+        "exit": 1 if added else 0,
+    }
+    report["added"] = added
+    report["fixed"] = fixed
+    report["duration_ms"] = duration_ms
+    return report
+
+
+def atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def write_state(report: dict, state_dir: Path) -> None:
+    """last.json 原子覆盖；doctor.log 追加同一行 JSON。仓库文件不参与。"""
+    line = json.dumps(report, ensure_ascii=False) + "\n"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write(state_dir / "last.json", line)
+    with (state_dir / "doctor.log").open("a", encoding="utf-8") as handle:
+        handle.write(line)
+
+
+def parse_state_ts(text: object) -> datetime | None:
+    if not isinstance(text, str):
+        return None
+    try:
+        value = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return value.astimezone() if value.tzinfo is None else value
+
+
+def load_log(state_dir: Path) -> list[dict]:
+    path = state_dir / "doctor.log"
+    if not path.is_file():
+        return []
+    runs: list[dict] = []
+    for line in read_text(path).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict) and parse_state_ts(item.get("ts")):
+            runs.append(item)
+    return runs
+
+
+def since_entries(state_dir: Path, start: datetime, end: datetime) -> list[tuple]:
+    """窗口内每个 (符号, id) 只留最后一次，按时间升序。"""
+    events: dict[tuple[str, str], tuple] = {}
+    for run in load_log(state_dir):
+        moment = parse_state_ts(run.get("ts"))
+        if moment is None or not start <= moment <= end:
+            continue
+        for key, sign in (("added", "+"), ("fixed", "-")):
+            items = run.get(key)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                    continue
+                detail = item.get("detail") if isinstance(item.get("detail"), str) else ""
+                events[(sign, item["id"])] = (moment, sign, item["id"], detail)
+    return sorted(events.values(), key=lambda event: (event[0], event[1], event[2]))
+
+
+def parse_since_window(spec: str, now: datetime) -> tuple[datetime, datetime]:
+    raw = spec.strip()
+    match = SINCE_RE.match(raw)
+    if match:
+        seconds = int(match.group(1)) * SINCE_UNITS[match.group(2)]
+        return now - timedelta(seconds=seconds), now
+    if raw == "today":
+        return datetime.combine(now.date(), datetime.min.time()).astimezone(), now
+    if raw == "yesterday":
+        start = datetime.combine(now.date() - timedelta(days=1), datetime.min.time()).astimezone()
+        return start, min(start + timedelta(days=1), now)
+    if SINCE_DATE_RE.match(raw):
+        start = datetime.combine(date.fromisoformat(raw), datetime.min.time()).astimezone()
+        return start, min(start + timedelta(days=1), now)
+    try:
+        moment = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise DoctorError(f"无法解析 --since {spec!r}（支持 24h / yesterday / today / YYYY-MM-DD / YYYY-MM-DDTHH:MM）") from exc
+    if moment.tzinfo is None:
+        moment = moment.astimezone()
+    return moment, now
+
+
+def last_run(state_dir: Path) -> dict | None:
+    runs = load_log(state_dir)
+    return runs[-1] if runs else None
+
+
+def summary_changes(report: dict, previous: dict | None) -> list[str]:
+    """自上次巡检以来新增/修复的漂移条目（对比 doctor.log 上一行）。"""
+    prev_added: set[tuple[str, str]] = set()
+    prev_fixed: set[str] = set()
+    if isinstance(previous, dict):
+        for item in previous.get("added", []):
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                prev_added.add((item["id"], item.get("detail", "")))
+        for item in previous.get("fixed", []):
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                prev_fixed.add(item["id"])
+    changes: list[str] = []
+    for item in report["added"]:
+        if (item["id"], item["detail"]) not in prev_added:
+            changes.append(f"+ {item['id']}")
+    for item in report["fixed"]:
+        if item["id"] not in prev_fixed:
+            changes.append(f"- {item['id']}")
+    return changes
+
+
+def print_summary(report: dict, state_dir: Path, previous: dict | None) -> None:
+    now = datetime.now().astimezone()
+    start = now - timedelta(hours=24)
+    recent_added = {event[2] for event in since_entries(state_dir, start, now) if event[1] == "+"}
+    changes = summary_changes(report, previous)
+    print(
+        f"配置漂移: 漂移 {report['drift']} · baseline {report['baselined']} · "
+        f"known {report['known']} · 昨日新增 {len(recent_added)} · "
+        f"最近变更 {'、'.join(changes) if changes else '无'}"
+    )
+    for item in report["added"][:SUMMARY_ADDED_MAX]:
+        label = "值变" if item["kind"] == "value_changed" else "新增"
+        print(f"  + {item['id']}（{label}）")
+    if len(report["added"]) > SUMMARY_ADDED_MAX:
+        print(f"  + 还有 {len(report['added']) - SUMMARY_ADDED_MAX} 条")
+
+
+def print_since(state_dir: Path, spec: str) -> int:
+    now = datetime.now().astimezone()
+    start, end = parse_since_window(spec, now)
+    events = since_entries(state_dir, start, end)
+    if not events:
+        print("无变化")
+        return 0
+    for moment, sign, ident, detail in events:
+        line = f"{moment.astimezone().strftime('%Y-%m-%d %H:%M')} {sign} {ident}"
+        if detail:
+            line += f" {detail}"
+        print(line)
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    started = time.monotonic()
     parser = argparse.ArgumentParser(
         prog="doctor",
         description="对照 doctor/facts.toml、README、kanshi/config 与真机状态；仓库同步复用 tools/check-sync.sh。",
@@ -1580,7 +1797,21 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--refresh", action="store_true", help="从真机重采事实并重写 doctor/facts.toml")
     parser.add_argument("--render", action="store_true", help="按事实重写 README 的 doctor environment 段")
     parser.add_argument("--accept", action="store_true", help="把当前所有 DRIFT 写进 doctor/baseline.toml")
+    parser.add_argument("--state-dir", type=Path, default=None, help=argparse.SUPPRESS)
+    report_group = parser.add_mutually_exclusive_group()
+    report_group.add_argument("--summary", action="store_true", help="单行晨报；有新增时附最多 5 条明细")
+    report_group.add_argument("--json", action="store_true", help="输出稳定 schema 的单个 JSON 对象")
+    report_group.add_argument("--since", metavar="SPEC", help="汇总 doctor.log 窗口：24h / yesterday / today / YYYY-MM-DD / YYYY-MM-DDTHH:MM")
     args = parser.parse_args(argv)
+
+    if (args.summary or args.json) and (args.refresh or args.render or args.accept):
+        parser.error("--summary/--json 不能与 --refresh/--render/--accept 同用")
+    if args.since is not None and (args.refresh or args.render or args.accept):
+        parser.error("--since 不能与 --refresh/--render/--accept 同用")
+
+    state_dir = (args.state_dir or default_state_dir()).expanduser()
+    if args.since is not None:
+        return print_since(state_dir, args.since)
 
     root = args.root.resolve()
     facts_path = root / "doctor/facts.toml"
@@ -1674,6 +1905,21 @@ def main(argv: list[str]) -> int:
 
     baseline = load_baseline(baseline_path)
     rows = apply_baseline(rows, baseline)
+
+    report = report_dict(rows, int((time.monotonic() - started) * 1000))
+    previous = last_run(state_dir)
+    try:
+        write_state(report, state_dir)
+    except OSError as error:
+        print(f"doctor: 状态写入失败（{state_dir}）：{error}", file=sys.stderr)
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False))
+        return report["exit"]
+    if args.summary:
+        print_summary(report, state_dir, previous)
+        return report["exit"]
+
     print_rows(rows)
 
     drift = sum(1 for row in rows if row[3].startswith("DRIFT"))
