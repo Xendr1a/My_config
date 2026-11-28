@@ -77,12 +77,14 @@ doctor 只读 niri、kanshi、alacritty、noctalia 的配置，不会为了变�
 沿用原来的写模式，不写这两个状态文件。
 
 - `--summary`：汇总行固定为
-  `doctor: 漂移 N · baseline N · known N · 昨日新增 N · 最近变更 <无|文件列表>`；
+  `配置漂移: 漂移 N · baseline N · known N · 昨日新增 N · 最近变更 <无|漂移条目>`；
   有新增时从第二行起列 `+ <id>（<值变|新增>）`，最多 5 条，多则 `+ 还有 N 条`。
-  「昨日新增」是 `doctor.log` 近 24h 的去重新增 id 数；「最近变更」是近 24h git 提交
-  涉及的文件（没有则 `无`）。
+  「昨日新增」是 `doctor.log` 近 24h 的去重新增 id 数；「最近变更」对比 `doctor.log`
+  上一次巡检，只列自上次以来新增（`+`）或修复（`-`）的漂移条目，零变化为 `无`。
 - `--json`：单个对象，字段顺序固定为
-  `ts, checks, drift, baselined, known, skipped, exit, added[{id,detail,kind}], fixed[{id}], duration_ms`。
+  `ts, schema, checks, items, drift, baselined, known, skipped, exit, added[{id,detail,kind}], fixed[{id}], duration_ms`。
+  `schema` 目前为 `1`；`items` 与 `checks` 都是检查总数（61 是其中一项分母），
+  因为 fcitx5 激活输入法行始终输出，同一台机器的 `items` 不随焦点变化。
 - `--since`：接受 `24h`（也支持 `30m` / `2d` 这类写法）、`yesterday`、`today`、
   `YYYY-MM-DD`、`YYYY-MM-DDTHH:MM`；窗口内无变化打印 `无变化`，否则每行
   `<时间> <+/-> <id> <detail>`（同一 id 的同向事件只留最后一次）。

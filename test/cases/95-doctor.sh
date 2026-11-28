@@ -224,22 +224,31 @@ printf 'clean\n' >"$tmp/sync-mode"
 "$doctor" --root "$tmp" --state-dir "$tmp/state-summary" --summary >"$tmp/sum" 2>&1 ||
   fail 'doctor --summary' "$(cat "$tmp/sum")"
 [[ $(wc -l <"$tmp/sum") -eq 1 ]] || fail '--summary 无漂移恰好一行' "$(cat "$tmp/sum")"
-grep -Eq '^doctor: 漂移 0 · baseline 0 · known 0 · 昨日新增 0 · 最近变更 .+$' "$tmp/sum" ||
-  fail '--summary 字段顺序固定' "$(cat "$tmp/sum")"
-pass '--summary 单行且字段顺序固定'
+grep -Eq '^配置漂移: 漂移 0 · baseline 0 · known 0 · 昨日新增 0 · 最近变更 无$' "$tmp/sum" ||
+  fail '--summary 字段顺序固定且零变化为无' "$(cat "$tmp/sum")"
+assert_file "$tmp/state-summary/last.json" '零漂移也写 last.json'
+pass '--summary 单行、字段顺序固定、零变化为无'
 
+"$doctor" --root "$tmp" --state-dir "$tmp/state-json" >"$tmp/out" 2>&1 ||
+  fail '默认检查（取 items 基准）' "$(cat "$tmp/out")"
+items_actual=$(sed -n 's/^# 检查 \([0-9]\+\) 项.*/\1/p' "$tmp/out")
+[[ -n "$items_actual" ]] || fail '默认输出含检查总数' "$(cat "$tmp/out")"
 "$doctor" --root "$tmp" --state-dir "$tmp/state-json" --json >"$tmp/json" 2>&1 ||
   fail 'doctor --json' "$(cat "$tmp/json")"
 python3 -m json.tool "$tmp/json" >/dev/null || fail '--json 不是合法 JSON' "$(cat "$tmp/json")"
-python3 - "$tmp/json" <<'PY' || fail '--json schema 不符'
+python3 - "$tmp/json" "$items_actual" <<'PY' || fail '--json schema / items 不符'
 import json, sys
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
-want = ["ts", "checks", "drift", "baselined", "known", "skipped", "exit", "added", "fixed", "duration_ms"]
-raise SystemExit(0 if list(obj) == want and obj["drift"] == 0 and obj["exit"] == 0
+actual = int(sys.argv[2])
+want = ["ts", "schema", "checks", "items", "drift", "baselined", "known", "skipped", "exit",
+        "added", "fixed", "duration_ms"]
+raise SystemExit(0 if list(obj) == want and obj["schema"] == 1
+                 and obj["items"] == actual and obj["checks"] == actual
+                 and obj["drift"] == 0 and obj["exit"] == 0
                  and obj["added"] == [] and obj["fixed"] == []
                  and isinstance(obj["ts"], str) and isinstance(obj["duration_ms"], int) else 1)
 PY
-pass '--json schema 稳定'
+pass '--json schema 稳定且 items 等于实际检查行数'
 
 rm -rf "$tmp/state-log"
 "$doctor" --root "$tmp" --state-dir "$tmp/state-log" --json >/dev/null 2>&1 || fail '巡检第一次运行'
@@ -259,25 +268,41 @@ pass '连续运行追加日志并覆盖 last.json'
 
 "$doctor" --root "$tmp" --state-dir "$tmp/state-since" --since 24h >"$tmp/since" 2>&1
 grep -qx '无变化' "$tmp/since" || fail '--since 无变化' "$(cat "$tmp/since")"
+# 先跑一次零漂移，确立「上次巡检」；再造一条漂移看摘要只列这一条。
+"$doctor" --root "$tmp" --state-dir "$tmp/state-since" --summary >/dev/null 2>&1 ||
+  fail '--summary 基线巡检'
 printf 'niri\n' >"$tmp/sync-mode"
-if "$doctor" --root "$tmp" --state-dir "$tmp/state-since" --json >/dev/null 2>&1; then
-  fail '有漂移时 --json 应退出 1'
+if "$doctor" --root "$tmp" --state-dir "$tmp/state-since" --summary >"$tmp/sum" 2>&1; then
+  fail '有漂移时 --summary 应退出 1'
 fi
+[[ $(wc -l <"$tmp/sum") -eq 2 ]] || fail '--summary 有新增时两行' "$(cat "$tmp/sum")"
+grep -qx '配置漂移: 漂移 1 · baseline 0 · known 0 · 昨日新增 1 · 最近变更 + check-sync DIFF niri/config.kdl' "$tmp/sum" ||
+  fail '--summary 只列自上次以来的漂移条目' "$(cat "$tmp/sum")"
+grep -qx '  + check-sync DIFF niri/config.kdl（新增）' "$tmp/sum" ||
+  fail '--summary 展开新增明细' "$(cat "$tmp/sum")"
 "$doctor" --root "$tmp" --state-dir "$tmp/state-since" --since 24h >"$tmp/since" 2>&1
 grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} \+ check-sync DIFF niri/config\.kdl ' "$tmp/since" ||
   fail '--since 列出窗口内新增' "$(cat "$tmp/since")"
 "$doctor" --root "$tmp" --state-dir "$tmp/state-since" --since today >"$tmp/since" 2>&1
 grep -q 'check-sync DIFF niri/config.kdl' "$tmp/since" || fail '--since today 可解析' "$(cat "$tmp/since")"
-if "$doctor" --root "$tmp" --state-dir "$tmp/state-since" --summary >"$tmp/sum" 2>&1; then
-  fail '有漂移时 --summary 应退出 1'
+if "$doctor" --root "$tmp" --state-dir "$tmp/state-since" --json >/dev/null 2>&1; then
+  fail '有漂移时 --json 应退出 1'
 fi
-[[ $(wc -l <"$tmp/sum") -eq 2 ]] || fail '--summary 有新增时两行' "$(cat "$tmp/sum")"
-grep -Eq '^doctor: 漂移 1 · baseline 0 · known 0 · 昨日新增 1 · 最近变更 ' "$tmp/sum" ||
-  fail '--summary 有新增时的汇总行' "$(cat "$tmp/sum")"
-grep -qx '  + check-sync DIFF niri/config.kdl（新增）' "$tmp/sum" ||
-  fail '--summary 展开新增明细' "$(cat "$tmp/sum")"
+# 漂移持续存在、没有新变化时，最近变更回到「无」。
+if "$doctor" --root "$tmp" --state-dir "$tmp/state-since" --summary >"$tmp/sum" 2>&1; then
+  fail '稳定漂移仍应退出 1'
+fi
+grep -q '最近变更 无$' "$tmp/sum" || fail '稳定漂移不再重复列为最近变更' "$(cat "$tmp/sum")"
+# 修复 baseline 条目要出现在最近变更里（- id）。
+printf 'niri\n' >"$tmp/sync-mode"
+"$doctor" --root "$tmp" --state-dir "$tmp/state-since" --accept >/dev/null 2>&1 || fail '造 baseline 条目'
 printf 'clean\n' >"$tmp/sync-mode"
-pass '--since 窗口筛选与晨报明细'
+"$doctor" --root "$tmp" --state-dir "$tmp/state-since" --summary >"$tmp/sum" 2>&1 ||
+  fail '已修复 baseline 时 --summary 退出 0'
+grep -q '最近变更 - check-sync DIFF niri/config.kdl$' "$tmp/sum" ||
+  fail '--summary 列出已修复条目' "$(cat "$tmp/sum")"
+"$doctor" --root "$tmp" --state-dir "$tmp/state-since" --accept >/dev/null 2>&1 || fail '收紧 baseline'
+pass '--since 窗口筛选与晨报最近变更语义'
 
 facts_mtime=$(stat -c %y "$ROOT/doctor/facts.toml")
 baseline_mtime=$(stat -c %y "$ROOT/doctor/baseline.toml")

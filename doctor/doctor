@@ -1542,15 +1542,15 @@ def check_host(facts: dict, live: dict, errors: list[str], facts_path: Path, roo
                 facts["fcitx5"]["default_im"] == (fcitx5["profile_im"] or fcitx5["default_im"]),
             )
         )
-        if fcitx5["running_im"]:
-            rows.append(
-                make_row(
-                    "真机 fcitx5 当前激活输入法",
-                    "随焦点变化，不作基线",
-                    fcitx5["running_im"],
-                    "INFO",
-                )
-            )
+    # 激活输入法随焦点变化，只提示；行始终存在，保证检查总数（items）稳定。
+    rows.append(
+        make_row(
+            "真机 fcitx5 当前激活输入法",
+            "随焦点变化，不作基线",
+            fcitx5["running_im"] or "无",
+            "INFO",
+        )
+    )
     return rows
 
 
@@ -1618,7 +1618,9 @@ def report_dict(rows: list[tuple[str, str, str, str]], duration_ms: int) -> dict
             skipped += 1
     report = {
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "schema": 1,
         "checks": len(rows),
+        "items": len(rows),
         "drift": len(added),
         "baselined": baselined,
         "known": known,
@@ -1727,33 +1729,41 @@ def parse_since_window(spec: str, now: datetime) -> tuple[datetime, datetime]:
     return moment, now
 
 
-def recent_files(root: Path, since: datetime) -> list[str]:
-    """近 24h git 提交涉及的文件；没有 git 或没有提交时为空。"""
-    if shutil.which("git") is None or not (root / ".git").exists():
-        return []
-    proc = run(
-        ["git", "-C", str(root), "log", f"--since={since.isoformat(timespec='seconds')}", "--name-only", "--pretty=format:"],
-        timeout=15,
-    )
-    if proc.returncode != 0:
-        return []
-    files: list[str] = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if line and line not in files:
-            files.append(line)
-    return files
+def last_run(state_dir: Path) -> dict | None:
+    runs = load_log(state_dir)
+    return runs[-1] if runs else None
 
 
-def print_summary(report: dict, state_dir: Path, root: Path) -> None:
+def summary_changes(report: dict, previous: dict | None) -> list[str]:
+    """自上次巡检以来新增/修复的漂移条目（对比 doctor.log 上一行）。"""
+    prev_added: set[tuple[str, str]] = set()
+    prev_fixed: set[str] = set()
+    if isinstance(previous, dict):
+        for item in previous.get("added", []):
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                prev_added.add((item["id"], item.get("detail", "")))
+        for item in previous.get("fixed", []):
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                prev_fixed.add(item["id"])
+    changes: list[str] = []
+    for item in report["added"]:
+        if (item["id"], item["detail"]) not in prev_added:
+            changes.append(f"+ {item['id']}")
+    for item in report["fixed"]:
+        if item["id"] not in prev_fixed:
+            changes.append(f"- {item['id']}")
+    return changes
+
+
+def print_summary(report: dict, state_dir: Path, previous: dict | None) -> None:
     now = datetime.now().astimezone()
     start = now - timedelta(hours=24)
     recent_added = {event[2] for event in since_entries(state_dir, start, now) if event[1] == "+"}
-    files = recent_files(root, start)
+    changes = summary_changes(report, previous)
     print(
-        f"doctor: 漂移 {report['drift']} · baseline {report['baselined']} · "
+        f"配置漂移: 漂移 {report['drift']} · baseline {report['baselined']} · "
         f"known {report['known']} · 昨日新增 {len(recent_added)} · "
-        f"最近变更 {'、'.join(files) if files else '无'}"
+        f"最近变更 {'、'.join(changes) if changes else '无'}"
     )
     for item in report["added"][:SUMMARY_ADDED_MAX]:
         label = "值变" if item["kind"] == "value_changed" else "新增"
@@ -1897,6 +1907,7 @@ def main(argv: list[str]) -> int:
     rows = apply_baseline(rows, baseline)
 
     report = report_dict(rows, int((time.monotonic() - started) * 1000))
+    previous = last_run(state_dir)
     try:
         write_state(report, state_dir)
     except OSError as error:
@@ -1906,7 +1917,7 @@ def main(argv: list[str]) -> int:
         print(json.dumps(report, ensure_ascii=False))
         return report["exit"]
     if args.summary:
-        print_summary(report, state_dir, root)
+        print_summary(report, state_dir, previous)
         return report["exit"]
 
     print_rows(rows)
