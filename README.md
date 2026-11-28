@@ -17,7 +17,7 @@
 | `system-files/` | `/etc` 与 `/usr/local` 下手工改过的文件 |
 | `archive/` | 已退役方案，只作历史留档，不要部署 |
 | `tools/check-sync.sh` | 比对仓库与实机，只读 |
-| `doctor/` | 环境事实基线 `facts.toml` 与自检脚本；漂移非零退出 |
+| `doctor/` | 事实基线 `facts.toml`、已接受漂移 `baseline.toml` 与自检脚本 |
 | `packages/` | 重装时要装的包清单（official / foreign） |
 | `migrations/` | 一次性状态修复脚本 |
 | `test/` | 本地测试集 |
@@ -46,6 +46,7 @@
 `doctor/facts.toml` 是唯一事实基线：由真机采集，可编辑、可 diff。doctor 不重复实现仓库 ↔ 实机同步，只补 `tools/check-sync.sh` 没覆盖的维度：
 
 - 配置同步：直接调用 `tools/check-sync.sh`，按它的 `same` / `drift` / `DIFF` / `MISSING` 行出表；`facts.toml` 的 `[[known]]` 命中的差异只打印（`KNOWN`），不计失败。
+- 已接受的既有漂移记在 `doctor/baseline.toml`：每项是稳定 id + 观测值 sha256。它不是忽略列表——观测值一变就重新报 `DRIFT`；不在 baseline 的新漂移也报 `DRIFT`。修好后的条目只在 `--accept` 时收紧，doctor 不会自动删。
 - 本机事实：hostname、显示器连接器 / 当前模式 / 缩放（当前 off 的输出改为校验基线模式仍在可用列表）、背光设备、外接屏 `ddcutil` VCP `0x10`。
 - niri 命名工作区与 `~/.local/bin/scene` 三个键位、kanshi profile 对当前输出的适配（kanshi 没启用也照常判定）。
 - fontconfig 实际中文解析结果、fcitx5 profile 默认输入法（当前激活输入法随焦点变化，只提示不判定）。
@@ -55,10 +56,13 @@
 
 ```shell
 ./doctor/doctor                     # 检查
+./doctor/doctor --accept            # 把当前所有 DRIFT 写进 doctor/baseline.toml
 ./doctor/doctor --refresh           # 从 DMI、niri、backlight、ddcutil、fc-match、fcitx5、已装终端重采事实
 ./doctor/doctor --render            # 按事实重写 README 环境段
 ./doctor/doctor --refresh --render  # 硬件或布局变了以后一次改完
 ```
+
+`--accept` 只在人工确认“这些漂移现在可以接受”时用：它按当前 `DRIFT` 重写整个 baseline（按 id 排序，保留已有 `reason`）。之后命中且观测值一致的项显示 `BASELINED`；新增漂移、baseline 观测值变化都返回非零。baseline 里有、当前已不漂移的项显示 `INFO 已修复，可 --accept 收紧基线`，但不会自动删除。
 
 doctor 只读 niri、kanshi、alacritty、noctalia 的配置，不会为了变绿去改它们；kanshi、check-sync 报出的真实差异交回各自维护者。
 

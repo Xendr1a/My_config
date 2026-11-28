@@ -1,0 +1,104 @@
+# doctor baseline —— 已接受的既有漂移，不是忽略列表。
+# id 是检查项的稳定标识；observed 是「声明值 / 实际值」的 sha256（HOME 归一化成 ~）。
+# 观测值一变就会重新报 DRIFT；--accept 按当前漂移重写本文件，排序稳定。
+# 修好漂移后跑 ./doctor/doctor --accept 收紧基线；doctor 不会自动删条目。
+
+[[baseline]]
+id = "check-sync DIFF alacritty/"
+observed = "sha256:3870bf90a62e0d3de48476b162fd6e0d9ef059e7be3475ab666a09681592d822"
+detail = "alacritty/ -> ~/.config/alacritty/"
+reason = "实机 Dragon Mist 主题尚未入库；等 Dragon Mist 去留拍板（桌面菜逢螃蟹）"
+
+[[baseline]]
+id = "check-sync DIFF home/.gitconfig"
+observed = "sha256:7d88c4959dd717557011bdbd518c7d3b82e060bfa40a95c7716d6554a98314b9"
+detail = "home/.gitconfig -> ~/.gitconfig (16 行差异)"
+reason = "实机本地身份/代理配置领先；待确认是否回传仓库"
+
+[[baseline]]
+id = "check-sync DIFF local/bin/ocr-region"
+observed = "sha256:fca422cb0d4ab8566673b0751fe89001c198df8e98a62359f8837f3e00bc2178"
+detail = "local/bin/ocr-region -> ~/.local/bin/ocr-region (9 行差异)"
+
+[[baseline]]
+id = "check-sync DIFF p10k/.p10k.zsh"
+observed = "sha256:e6bea7803f1be066e989571a71e3730b995cfc8a03338c783368af9ff58e241d"
+detail = "p10k/.p10k.zsh -> ~/.p10k.zsh (374 行差异)"
+
+[[baseline]]
+id = "check-sync DIFF systemd/user/hermes-gateway.service"
+observed = "sha256:f3a8c83e16108a6429b0caec79dfabed6fe5862ca796480fb06688f82ae2f4e4"
+detail = "systemd/user/hermes-gateway.service -> ~/.config/systemd/user/hermes-gateway.service (15 行差异)"
+
+[[baseline]]
+id = "check-sync DIFF tmux/.tmux.conf.local"
+observed = "sha256:197d1b588a31500d3a515080404f661c4cb955e00247d447f3ce840711f39597"
+detail = "tmux/.tmux.conf.local -> ~/.config/tmux/.tmux.conf.local (492 行差异)"
+
+[[baseline]]
+id = "check-sync MISSING autostart/Manggo.desktop"
+observed = "sha256:2bfee7e9d7855ba4710e74cd501a5c7a6b9154ed65d7c40b2ffe8c9cf3882551"
+detail = "autostart/Manggo.desktop -> 实机缺失：~/.config/autostart/Manggo.desktop"
+
+[[baseline]]
+id = "check-sync MISSING kanshi/config"
+observed = "sha256:5704586ba66249d71400ec513b5d38a25bfe6fbc16d798ee46ce2a52456d7d45"
+detail = "kanshi/config -> 实机缺失：~/.config/kanshi/config"
+
+[[baseline]]
+id = "check-sync MISSING local/bin/Manggo"
+observed = "sha256:bf12598280c700ed0b82ab26b525cb24dc78a37c8f6a3ca2f8740e1be5cbfffc"
+detail = "local/bin/Manggo -> 实机缺失：~/.local/bin/Manggo"
+
+[[baseline]]
+id = "check-sync MISSING micmute-led/90-micmute-led.rules"
+observed = "sha256:55a0345bf7ec986d97ceef35c73c65185cb9b6101fdc2c04eb333c267a16ac17"
+detail = "micmute-led/90-micmute-led.rules -> 实机缺失：/etc/udev/rules.d/90-micmute-led.rules"
+
+[[baseline]]
+id = "check-sync MISSING micmute-led/micmute-led-sync.service"
+observed = "sha256:ba83320c0260e755de69a6975fdcd077cd8a051bc8b1173325c5c5fdbc84959f"
+detail = "micmute-led/micmute-led-sync.service -> 实机缺失：~/.config/systemd/user/micmute-led-sync.service"
+
+[[baseline]]
+id = "check-sync MISSING micmute-led/micmute-led-sync.sh"
+observed = "sha256:2956c6cb507f786262868496d82bbe79408d346bb39880706137d91f219cd626"
+detail = "micmute-led/micmute-led-sync.sh -> 实机缺失：~/.local/bin/micmute-led-sync.sh"
+reason = "ThinkPad 专有，本机无麦克风 LED 节点；上游遗留未部署（桌面菜逢螃蟹）"
+
+[[baseline]]
+id = "check-sync MISSING system-files/etc/udev/hwdb.d/61-battery-local.hwdb"
+observed = "sha256:d8fedfa8fa75bb5132810bd02f19e9787ffb6c68a1f7cba570c3ef4ff79fa593"
+detail = "system-files/etc/udev/hwdb.d/61-battery-local.hwdb -> 实机缺失：/etc/udev/hwdb.d/61-battery-local.hwdb"
+reason = "本机 BAT0 不支持充电阈值；上游遗留未部署"
+
+[[baseline]]
+id = "check-sync MISSING systemd/user/hermes-gateway.service.d/computer-use-wayland.conf"
+observed = "sha256:8e0f3bea838398fc795196d284050c21b8ddb2c5225c23c36492b8cdc6a69a96"
+detail = "systemd/user/hermes-gateway.service.d/computer-use-wayland.conf -> 实机缺失：~/.config/systemd/user/hermes-gateway.service.d/computer-use-wayland.conf"
+
+[[baseline]]
+id = "check-sync MISSING systemd/user/hermes-gateway.service.d/launch.conf"
+observed = "sha256:05e47c05b1379fccc9f322562cce81418c94a2f42d0f5e082978a3138176dce0"
+detail = "systemd/user/hermes-gateway.service.d/launch.conf -> 实机缺失：~/.config/systemd/user/hermes-gateway.service.d/launch.conf"
+
+[[baseline]]
+id = "check-sync MISSING systemd/user/hermes-gateway.service.d/override.conf"
+observed = "sha256:43b4f3fc6add2108116dffcac6187bda798c0d4b6e6a5a63d5c68e9134aef6a0"
+detail = "systemd/user/hermes-gateway.service.d/override.conf -> 实机缺失：~/.config/systemd/user/hermes-gateway.service.d/override.conf"
+
+[[baseline]]
+id = "check-sync MISSING systemd/user/hermes-gateway.service.d/proxy.conf"
+observed = "sha256:25feb68795c2a25beaa63da9bab95e6c04a921dc52f90ccef40aea4d2012641b"
+detail = "systemd/user/hermes-gateway.service.d/proxy.conf -> 实机缺失：~/.config/systemd/user/hermes-gateway.service.d/proxy.conf"
+
+[[baseline]]
+id = "check-sync MISSING systemd/user/kanshi.service"
+observed = "sha256:cd6b0249e57c8dd2f78dea49910e1433a6ffc631c0798427b73c6636c812c5ac"
+detail = "systemd/user/kanshi.service -> 实机缺失：~/.config/systemd/user/kanshi.service"
+
+[[baseline]]
+id = "kanshi 适配"
+observed = "sha256:a44d79547c899dd266b84e195c900b2bb9ee1d0bc15954755ecec8277e5f55f2"
+detail = "至少一个 profile 可适配 -> 0/3 个（kanshi 未启用也照常判定）"
+reason = "kanshi 未启用；dp1/dp2/mobile 旧 profile 等桌面菜逢螃蟹决定删除或补真实接口"

@@ -11,18 +11,23 @@ tools/check-sync.sh 没覆盖的维度：
   5. fontconfig 实际中文字体解析、fcitx5 profile 默认输入法；
   6. 按事实渲染 README 的 doctor environment 段。
 
+已接受的既有漂移记在 doctor/baseline.toml（id + 观测值哈希）；只有新增漂移或
+baseline 观测值变化才非零退出。`--accept` 按当前漂移重写 baseline。
+
 不采集夜间光 / 色温：Noctalia 只有控制命令，没有查询接口。
 
 用法：
   ./doctor/doctor                 检查
   ./doctor/doctor --refresh       从真机重采事实并重写 doctor/facts.toml
   ./doctor/doctor --render        按事实重写 README 环境段
+  ./doctor/doctor --accept        把当前漂移写进 doctor/baseline.toml
   ./doctor/doctor --refresh --render
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -890,7 +895,7 @@ def check_sync(root: Path) -> list[tuple]:
                 diff=counts["DIFF"],
                 missing=counts["MISSING"],
             ),
-            failed == 0,
+            "ok" if failed == 0 else "INFO",
         )
     )
     missed = [item for item in known if item["path"] not in hit_known]
@@ -1059,6 +1064,138 @@ def make_row(name: str, declared: str, actual: str, status) -> tuple[str, str, s
     else:
         verdict = str(status)
     return name, declared, actual, verdict
+
+
+# ---------- baseline ----------
+
+
+BASELINE_HEADER = [
+    "# doctor baseline —— 已接受的既有漂移，不是忽略列表。",
+    "# id 是检查项的稳定标识；observed 是「声明值 / 实际值」的 sha256（HOME 归一化成 ~）。",
+    "# 观测值一变就会重新报 DRIFT；--accept 按当前漂移重写本文件，排序稳定。",
+    "# 修好漂移后跑 ./doctor/doctor --accept 收紧基线；doctor 不会自动删条目。",
+]
+
+
+def normalize_home(text: str) -> str:
+    return text.replace(str(Path.home()), "~")
+
+
+def stable_id(name: str) -> str:
+    """去掉行号/文件后缀，得到跨运行稳定的检查 id。"""
+    return re.sub(r"\s+\[[^\]]*\]$", "", name).strip()
+
+
+def observation_hash(row: tuple[str, str, str, str]) -> str:
+    payload = normalize_home(row[1]) + "\x1f" + normalize_home(row[2])
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def observation_detail(row: tuple[str, str, str, str]) -> str:
+    return normalize_home(f"{row[1]} -> {row[2]}")
+
+
+def load_baseline(path: Path) -> dict[str, dict]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except OSError as exc:
+        raise DoctorError(f"读不到基线文件 {path}：{exc}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise DoctorError(f"{path} 不是合法 TOML：{exc}") from exc
+    items = data.get("baseline", [])
+    if not isinstance(items, list):
+        raise DoctorError(f"{path} 的 baseline 必须是数组")
+    result: dict[str, dict] = {}
+    for index, item in enumerate(items, 1):
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not isinstance(item.get("observed"), str):
+            raise DoctorError(f"{path} 的 baseline 第 {index} 项需要 id / observed")
+        if item["id"] in result:
+            raise DoctorError(f"{path} 的 baseline id 重复：{item['id']}")
+        result[item["id"]] = {
+            "observed": item["observed"],
+            "detail": item.get("detail", ""),
+            "reason": item.get("reason", ""),
+        }
+    return result
+
+
+def baseline_text(entries: dict[str, dict]) -> str:
+    lines = list(BASELINE_HEADER) + [""]
+    for key in sorted(entries):
+        item = entries[key]
+        lines += [
+            "[[baseline]]",
+            f"id = {dotenv(key)}",
+            f"observed = {dotenv(item['observed'])}",
+        ]
+        if item.get("detail"):
+            lines.append(f"detail = {dotenv(item['detail'])}")
+        if item.get("reason"):
+            lines.append(f"reason = {dotenv(item['reason'])}")
+        lines.append("")
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def write_baseline(path: Path, rows: list[tuple], existing: dict[str, dict]) -> dict[str, dict]:
+    entries: dict[str, dict] = {}
+    for row in rows:
+        if row[3] != "DRIFT":
+            continue
+        key = stable_id(row[0])
+        if key == "check-sync 汇总":
+            continue
+        entries[key] = {
+            "observed": observation_hash(row),
+            "detail": observation_detail(row),
+            "reason": existing.get(key, {}).get("reason", ""),
+        }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(baseline_text(entries), encoding="utf-8")
+    return entries
+
+
+def apply_baseline(rows: list[tuple], baseline: dict[str, dict]) -> list[tuple]:
+    result: list[tuple] = []
+    used: set[str] = set()
+    for row in rows:
+        name, declared, actual, status = row
+        if status != "DRIFT":
+            result.append(row)
+            continue
+        key = stable_id(name)
+        entry = baseline.get(key)
+        if entry is None:
+            result.append(row)
+            continue
+        used.add(key)
+        if entry["observed"] == observation_hash(row):
+            result.append((name, declared, actual, "BASELINED"))
+        else:
+            old = entry.get("detail") or entry["observed"]
+            result.append(
+                (
+                    name,
+                    declared,
+                    f"{actual}（旧观测：{clip(old, 44)}）",
+                    "DRIFT 值变",
+                )
+            )
+    for key in sorted(baseline):
+        if key in used:
+            continue
+        entry = baseline[key]
+        result.append(
+            (
+                f"baseline 已修复 {key}",
+                clip(entry.get("detail") or entry["observed"], 60),
+                "当前未漂移：已修复，可 --accept 收紧基线",
+                "INFO",
+            )
+        )
+    return result
 
 
 def check_readme(facts: dict, readme: Path, root: Path) -> list[tuple]:
@@ -1407,6 +1544,15 @@ def check_host(facts: dict, live: dict, errors: list[str], facts_path: Path, roo
     return rows
 
 
+def build_rows(facts: dict, readme: Path, root: Path, live: dict, errors: list[str], facts_path: Path) -> list[tuple]:
+    rows: list[tuple] = []
+    rows += check_readme(facts, readme, root)
+    rows += check_sync(root)
+    rows += check_host(facts, live, errors, facts_path, root)
+    rows += check_kanshi(facts, root / "kanshi/config", root, live)
+    return rows
+
+
 # ---------- 输出 ----------
 
 
@@ -1433,12 +1579,13 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent, help=argparse.SUPPRESS)
     parser.add_argument("--refresh", action="store_true", help="从真机重采事实并重写 doctor/facts.toml")
     parser.add_argument("--render", action="store_true", help="按事实重写 README 的 doctor environment 段")
+    parser.add_argument("--accept", action="store_true", help="把当前所有 DRIFT 写进 doctor/baseline.toml")
     args = parser.parse_args(argv)
 
     root = args.root.resolve()
     facts_path = root / "doctor/facts.toml"
+    baseline_path = root / "doctor/baseline.toml"
     readme = root / "README.md"
-    kanshi = root / "kanshi/config"
 
     if not (root / "README.md").is_file() or not (root / "tools/check-sync.sh").is_file():
         raise DoctorError(f"{root} 不像仓库根目录（缺 README.md 或 tools/check-sync.sh）")
@@ -1507,29 +1654,45 @@ def main(argv: list[str]) -> int:
         print(f"{relative(readme, root)} 环境段：{'已更新' if changed else '无变化'}")
 
     if args.refresh or args.render:
-        if args.refresh and args.render:
-            print("提示：再跑 ./doctor/doctor 确认没有剩余漂移")
-        return 0
+        if not args.accept:
+            if args.refresh and args.render:
+                print("提示：再跑 ./doctor/doctor 确认没有剩余漂移")
+            return 0
 
     facts = load_facts(facts_path)
     live, errors = collect_live(root)
-    rows: list[tuple] = []
-    rows += check_readme(facts, readme, root)
-    rows += check_sync(root)
-    rows += check_host(facts, live, errors, facts_path, root)
-    rows += check_kanshi(facts, kanshi, root, live)
+    rows = build_rows(facts, readme, root, live, errors, facts_path)
+
+    if args.accept:
+        existing = load_baseline(baseline_path)
+        entries = write_baseline(baseline_path, rows, existing)
+        print(f"{relative(baseline_path, root)}：已接受 {len(entries)} 条漂移")
+        for key in sorted(entries):
+            print(f"  accept {key}")
+        print("提示：再跑 ./doctor/doctor，命中 baseline 的项应显示 BASELINED")
+        return 0
+
+    baseline = load_baseline(baseline_path)
+    rows = apply_baseline(rows, baseline)
     print_rows(rows)
 
-    drift = sum(1 for row in rows if row[3] == "DRIFT")
+    drift = sum(1 for row in rows if row[3].startswith("DRIFT"))
+    baselined = sum(1 for row in rows if row[3] == "BASELINED")
+    fixed = sum(1 for row in rows if row[0].startswith("baseline 已修复 "))
     skipped = sum(1 for row in rows if row[3] == "SKIP")
     known_hits = sum(1 for row in rows if row[3] == "KNOWN")
     print()
-    print(f"# 检查 {len(rows)} 项：漂移 {drift}，known {known_hits}，跳过 {skipped}")
+    print(
+        f"# 检查 {len(rows)} 项：漂移 {drift}，BASELINED {baselined}，"
+        f"已修复 {fixed}，known {known_hits}，跳过 {skipped}"
+    )
     if drift:
+        print("# 新增或变值的漂移需要人看；确认接受后跑 ./doctor/doctor --accept")
         print("# README 段可自动更新：./doctor/doctor --render")
         print("# 事实过期可重采：./doctor/doctor --refresh（改完事实再看 README）")
-        print("# 仓库 ↔ 实机差异由 tools/check-sync.sh 提供；known 命中只打印不计失败")
         return 1
+    if fixed:
+        print("# 有已修复的 baseline 条目；跑 ./doctor/doctor --accept 收紧基线")
     return 0
 
 

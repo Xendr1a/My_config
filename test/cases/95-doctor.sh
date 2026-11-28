@@ -25,6 +25,9 @@ cat >"$tmp/tools/check-sync.sh" <<'SH'
 case "$(cat "$(dirname "$0")/../sync-mode")" in
   known) printf 'DIFF      home/.zshrc                                   -> /home/x/.zshrc (33 行差异)\n'; exit 1 ;;
   niri)  printf 'DIFF      niri/config.kdl                              -> /home/x/.config/niri/config.kdl (71 行差异)\n'; exit 1 ;;
+  niri2) printf 'DIFF      niri/config.kdl                              -> /home/x/.config/niri/config.kdl (99 行差异)\n'; exit 1 ;;
+  new)   printf 'DIFF      niri/config.kdl                              -> /home/x/.config/niri/config.kdl (99 行差异)\n'
+         printf 'DIFF      tmux/.tmux.conf.local                        -> /home/x/.config/tmux/.tmux.conf.local (492 行差异)\n'; exit 1 ;;
   *)     printf 'same      niri/config.kdl\n'; exit 0 ;;
 esac
 SH
@@ -162,3 +165,54 @@ if ! "$doctor" --root "$tmp" >"$tmp/out" 2>&1; then
   fail '恢复后 fixture 应退出 0' "$(cat "$tmp/out")"
 fi
 pass '恢复后退出 0'
+
+# baseline：接受当前 niri 漂移后应 BASELINED 且退出 0。
+printf 'niri\n' >"$tmp/sync-mode"
+"$doctor" --root "$tmp" --accept >"$tmp/out" 2>&1 || fail 'doctor --accept' "$(cat "$tmp/out")"
+assert_file "$tmp/doctor/baseline.toml" 'baseline 已写入'
+grep -q 'id = "check-sync DIFF niri/config.kdl"' "$tmp/doctor/baseline.toml" ||
+  fail 'baseline 记录稳定 id' "$(cat "$tmp/doctor/baseline.toml")"
+if ! "$doctor" --root "$tmp" >"$tmp/out" 2>&1; then
+  fail '命中 baseline 应退出 0' "$(cat "$tmp/out")"
+fi
+grep -q 'check-sync DIFF niri/config.kdl.*BASELINED' "$tmp/out" ||
+  fail 'baseline 命中标记 BASELINED' "$(cat "$tmp/out")"
+pass '命中 baseline 且观测值一致退出 0'
+
+# 同一 id 的观测值变化：必须重新报 DRIFT。
+printf 'niri2\n' >"$tmp/sync-mode"
+if "$doctor" --root "$tmp" >"$tmp/out" 2>&1; then
+  fail 'baseline 观测值变化应非零退出' "$(cat "$tmp/out")"
+fi
+grep -q 'check-sync DIFF niri/config.kdl.*DRIFT 值变' "$tmp/out" ||
+  fail '观测量变化标记 DRIFT' "$(cat "$tmp/out")"
+pass 'baseline 观测值变化重新报警'
+"$doctor" --root "$tmp" --accept >/dev/null 2>&1 || fail '更新 baseline 失败'
+
+# 新增一条 baseline 外的漂移：只报新增项，旧项仍 BASELINED。
+printf 'new\n' >"$tmp/sync-mode"
+if "$doctor" --root "$tmp" >"$tmp/out" 2>&1; then
+  fail '新增漂移应非零退出' "$(cat "$tmp/out")"
+fi
+grep -q 'check-sync DIFF niri/config.kdl.*BASELINED' "$tmp/out" ||
+  fail '旧漂移保持 BASELINED' "$(cat "$tmp/out")"
+grep -q 'check-sync DIFF tmux/.tmux.conf.local.*DRIFT' "$tmp/out" ||
+  fail '新增漂移被指出' "$(cat "$tmp/out")"
+pass '新增漂移只报新增项'
+
+# baseline 项已修复：退出码仍 0，并打 INFO 提示收紧。
+printf 'clean\n' >"$tmp/sync-mode"
+if ! "$doctor" --root "$tmp" >"$tmp/out" 2>&1; then
+  fail 'baseline 项已修复应退出 0' "$(cat "$tmp/out")"
+fi
+grep -q 'baseline 已修复 check-sync DIFF niri/config.kdl.*INFO' "$tmp/out" ||
+  fail '已修复项打 INFO' "$(cat "$tmp/out")"
+grep -q '可 --accept 收紧基线' "$tmp/out" || fail '已修复项提示 --accept'
+pass 'baseline 已修复项退出 0 并提示收紧'
+
+# --accept 收紧：没有漂移时应清空条目。
+"$doctor" --root "$tmp" --accept >"$tmp/out" 2>&1 || fail '收紧 baseline 失败' "$(cat "$tmp/out")"
+if grep -q '^\[\[baseline\]\]' "$tmp/doctor/baseline.toml"; then
+  fail '收紧后 baseline 应为空' "$(cat "$tmp/doctor/baseline.toml")"
+fi
+pass '--accept 可收紧基线'
