@@ -35,3 +35,7 @@ hermes/config.yaml
 
 # fcitx5 自动生成的键盘布局缓存
 /fcitx5/conf/cached_layouts
+
+# Python 自检脚本的字节码
+__pycache__/
+*.pyc

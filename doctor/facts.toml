@@ -1,0 +1,89 @@
+# 真机事实基线：由 ./doctor/doctor --refresh 采集，勿手改。
+# doctor 用它对照 README 环境段、kanshi/config、check-sync 与当前真机。
+# 夜间光/色温没有查询接口，不采集。
+
+[machine]
+vendor = "COLORFUL"
+product = "G16 24"
+hostname = "Xen"
+
+[terminal]
+primary = "alacritty"
+installed = ["alacritty", "foot"]
+
+[[outputs]]
+name = "eDP-1"
+make = "BOE"
+current = "2560x1600@240.000"
+scale = 1.5
+position = [5440, -700]
+modes = ["2560x1600@60.000", "2560x1600@240.000", "2560x1600@144.000", "640x480@59.940"]
+
+[[outputs]]
+name = "HDMI-A-1"
+make = "PNP(SAC)"
+current = "1920x1080@240.000"
+scale = 1.0
+position = [3520, 360]
+modes = [
+    "1920x1080@60.000",
+    "1920x1080@240.000",
+    "1920x1080@199.996",
+    "1920x1080@180.000",
+    "1920x1080@119.879",
+    "1920x1080@100.000",
+    "1920x1080@59.939",
+    "1920x1080@50.000",
+    "1680x1050@59.954",
+    "1600x900@60.000",
+    "1280x1024@75.025",
+    "1280x1024@60.020",
+    "1440x900@59.887",
+    "1280x960@60.000",
+    "1280x800@59.810",
+    "1152x864@75.000",
+    "1280x720@59.943",
+    "1280x720@50.000",
+    "1024x768@75.029",
+    "1024x768@70.069",
+    "1024x768@60.004",
+    "960x720@59.999",
+    "800x600@75.000",
+    "800x600@60.317",
+    "720x576@50.000",
+    "720x480@59.940",
+    "640x480@75.000",
+    "640x480@59.940",
+]
+
+[brightness]
+internal = "nvidia_0"
+external_connector = "HDMI-A-1"
+external_vcp = 16
+
+[niri]
+scene = "~/.local/bin/scene"
+workspaces = [
+    { name = "写作", output = "HDMI-A-1" },
+    { name = "打题", output = "HDMI-A-1" },
+]
+scene_keys = [
+    { key = "Mod+Shift+W", action = "write" },
+    { key = "Mod+Shift+D", action = "present" },
+    { key = "Mod+Shift+T", action = "ctf" },
+]
+
+[fontconfig]
+monospace_cjk = "Sarasa Mono SC"
+sans_serif_cjk = "Noto Sans CJK SC"
+
+[fcitx5]
+default_im = "pinyin"
+
+[[known]]
+path = "home/.zshrc"
+reason = "仓库重构版 vs 实机 Dragon Mist 配色版是两套分叉；统一与否挂在「Dragon Mist 是否入库」上（zoxide init 两边都有，不是漂移）"
+
+[[known]]
+path = "~/.local/bin/solo-display"
+reason = "实机游离脚本；My_config 的 MANIFEST 已收则 check-sync 显示 same，此条自动收敛"

@@ -1,0 +1,1704 @@
+#!/usr/bin/env python3
+"""My_config 环境自检。
+
+事实基线在 doctor/facts.toml，由真机采集（--refresh），不手填。doctor 只补
+tools/check-sync.sh 没覆盖的维度：
+
+  1. 调用 tools/check-sync.sh 做仓库 ↔ 实机同步（known 集合命中不算失败）；
+  2. 本机事实：hostname、输出连接器/当前模式/缩放、背光设备、ddcutil VCP 0x10；
+  3. niri 命名工作区与场景脚本键位；
+  4. kanshi profile 对当前输出的适配（kanshi 没启用也能判定）；
+  5. fontconfig 实际中文字体解析、fcitx5 profile 默认输入法；
+  6. 按事实渲染 README 的 doctor environment 段。
+
+已接受的既有漂移记在 doctor/baseline.toml（id + 观测值哈希）；只有新增漂移或
+baseline 观测值变化才非零退出。`--accept` 按当前漂移重写 baseline。
+
+不采集夜间光 / 色温：Noctalia 只有控制命令，没有查询接口。
+
+用法：
+  ./doctor/doctor                 检查
+  ./doctor/doctor --refresh       从真机重采事实并重写 doctor/facts.toml
+  ./doctor/doctor --render        按事实重写 README 环境段
+  ./doctor/doctor --accept        把当前漂移写进 doctor/baseline.toml
+  ./doctor/doctor --refresh --render
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+MARK_BEGIN = "<!-- doctor:begin environment -->"
+MARK_END = "<!-- doctor:end environment -->"
+TERMINALS = (
+    "alacritty",
+    "foot",
+    "kitty",
+    "wezterm",
+    "ghostty",
+    "konsole",
+    "xfce4-terminal",
+    "gnome-terminal",
+    "rio",
+    "st",
+    "urxvt",
+)
+MODE_RE = re.compile(r"^(\d+)x(\d+)@([0-9]+(?:\.[0-9]+)?)$")
+SYNC_RE = re.compile(r"^(same|drift|DIFF|MISSING)\s+(\S+)(?:\s+->\s+(\S+))?(.*)$")
+
+
+class DoctorError(Exception):
+    pass
+
+
+# ---------- 通用 ----------
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise DoctorError(f"读不到 {path}：{exc}") from exc
+
+
+def relative(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def display_width(text: str) -> int:
+    import unicodedata
+
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+
+
+def pad(text: str, width: int) -> str:
+    return text + " " * max(0, width - display_width(text))
+
+
+def clip(text: str, width: int = 52) -> str:
+    if display_width(text) <= width:
+        return text
+    out: list[str] = []
+    used = 0
+    for ch in text:
+        step = 2 if display_width(ch) == 2 else 1
+        if used + step > width - 1:
+            break
+        out.append(ch)
+        used += step
+    return "".join(out) + "…"
+
+
+def mode_parts(mode: str) -> tuple[int, int, float] | None:
+    match = MODE_RE.match(mode)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), float(match.group(3))
+
+
+def short_mode(mode: str) -> str:
+    if "@" not in mode:
+        return mode
+    size, rate = mode.split("@", 1)
+    try:
+        return f"{size}@{float(rate):.3f}".rstrip("0").rstrip(".")
+    except ValueError:
+        return mode
+
+
+def short_number(value: float) -> str:
+    return f"{float(value):g}"
+
+
+def dotenv(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def run(command: list[str], timeout: float = 10) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DoctorError(f"{command[0]} 执行失败：{exc}") from exc
+
+
+def canonical_home(path: str) -> str:
+    home = str(Path.home())
+    return "~" + path[len(home) :] if path == home or path.startswith(home + "/") else path
+
+
+# ---------- 真机采集 ----------
+
+
+def read_dmi(name: str) -> str:
+    try:
+        return Path(f"/sys/class/dmi/id/{name}").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def detect_primary_terminal(config: Path, installed: list[str]) -> str:
+    if config.is_file():
+        for match in re.finditer(r'\bspawn(?:-sh)?\s+"([^"]+)"', read_text(config)):
+            first = match.group(1).split()[0] if match.group(1).split() else ""
+            base = os.path.basename(first)
+            if base in installed:
+                return base
+    return installed[0] if installed else ""
+
+
+def collect_outputs() -> list[dict]:
+    niri = shutil.which("niri")
+    if niri is None:
+        raise DoctorError("找不到 niri，无法读取当前输出")
+    proc = run([niri, "msg", "--json", "outputs"])
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        raise DoctorError(f"niri msg --json outputs 失败：{detail[0] if detail else proc.returncode}")
+    try:
+        raw = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise DoctorError(f"niri msg 输出不是合法 JSON：{exc}") from exc
+
+    outputs: list[dict] = []
+    for name in sorted(raw, key=str.casefold):
+        item = raw[name]
+        modes = [
+            f"{mode['width']}x{mode['height']}@{mode['refresh_rate'] / 1000:.3f}"
+            for mode in item.get("modes", [])
+        ]
+        index = item.get("current_mode")
+        logical = item.get("logical") or {}
+        enabled = isinstance(index, int) and 0 <= index < len(modes) and isinstance(logical, dict) and bool(logical)
+        outputs.append(
+            {
+                "name": name,
+                "make": str(item.get("make", "")).strip(),
+                "enabled": enabled,
+                "current": modes[index] if enabled else "",
+                "modes": modes,
+                "scale": float(logical.get("scale", 0)) if enabled else 0.0,
+                "position": [int(logical.get("x", 0)), int(logical.get("y", 0))] if enabled else [0, 0],
+            }
+        )
+    return outputs
+
+
+def collect_brightness() -> dict:
+    base = Path("/sys/class/backlight")
+    devices = sorted(item.name for item in base.iterdir() if item.is_dir()) if base.is_dir() else []
+    readable = []
+    for name in devices:
+        current = base / name / "brightness"
+        maximum = base / name / "max_brightness"
+        try:
+            top = int(maximum.read_text(encoding="utf-8").strip())
+            int(current.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+        if top > 0:
+            readable.append(name)
+    return {"devices": readable, "internal": readable[0] if readable else ""}
+
+
+def collect_ddc(output_names: list[str]) -> dict:
+    if shutil.which("ddcutil") is None:
+        return {"available": False, "external": [], "error": "未安装 ddcutil"}
+    try:
+        detected = run(["ddcutil", "detect"], timeout=20)
+    except DoctorError as exc:
+        return {"available": False, "external": [], "error": str(exc)}
+    if detected.returncode != 0:
+        detail = (detected.stderr or detected.stdout).strip().splitlines()
+        return {
+            "available": False,
+            "external": [],
+            "error": detail[0] if detail else f"ddcutil detect 退出 {detected.returncode}",
+        }
+
+    displays: list[dict] = []
+    current: dict | None = None
+    for line in detected.stdout.splitlines():
+        match = re.match(r"^Display\s+(\d+)$", line.strip())
+        if match:
+            current = {"display": int(match.group(1)), "connector": ""}
+            displays.append(current)
+            continue
+        if line.strip() == "Invalid display":
+            current = None
+            continue
+        match = re.search(r"DRM_connector:\s*(?:card\d+-)?(\S+)", line)
+        if match and current is not None:
+            current["connector"] = match.group(1)
+
+    external = []
+    for item in displays:
+        connector = item["connector"]
+        if not connector or connector not in output_names:
+            continue
+        try:
+            value = run(["ddcutil", "--display", str(item["display"]), "getvcp", "10"], timeout=10)
+        except DoctorError:
+            continue
+        if value.returncode != 0:
+            continue
+        match = re.search(r"VCP code 0x10 .*current value =\s*(\d+),\s*max value =\s*(\d+)", value.stdout)
+        if not match:
+            continue
+        external.append(
+            {
+                "connector": connector,
+                "display": item["display"],
+                "current": int(match.group(1)),
+                "max": int(match.group(2)),
+            }
+        )
+    external.sort(key=lambda item: item["connector"].casefold())
+    return {"available": True, "external": external, "error": ""}
+
+
+def collect_niri_config() -> dict:
+    path = Path.home() / ".config/niri/config.kdl"
+    if not path.is_file():
+        return {"available": False, "config": str(path), "workspaces": [], "scene": "", "scene_keys": []}
+    text = read_text(path)
+    workspaces = []
+    for match in re.finditer(r'^workspace\s+"([^"]+)"\s*\{([^}]*)\}', text, re.M | re.S):
+        output = re.search(r'open-on-output\s+"([^"]+)"', match.group(2))
+        workspaces.append({"name": match.group(1), "output": output.group(1) if output else ""})
+    scene_keys = []
+    for line in text.splitlines():
+        match = re.match(r"\s*(Mod\+[A-Za-z0-9+]+)\b.*\bscene\s+(write|present|ctf)\b", line)
+        if match:
+            scene_keys.append({"key": match.group(1), "action": match.group(2)})
+    scene = ""
+    match = re.search(r'spawn(?:-sh)?\s+"[^"]*?\bexec\s+(\S+)\s+(?:write|present|ctf)\b', text)
+    if match:
+        scene = canonical_home(match.group(1))
+    elif (Path.home() / ".local/bin/scene").is_file():
+        scene = "~/.local/bin/scene"
+    return {
+        "available": True,
+        "config": str(path),
+        "workspaces": workspaces,
+        "scene": scene,
+        "scene_keys": scene_keys,
+    }
+
+
+def collect_fontconfig() -> dict:
+    if shutil.which("fc-match") is None:
+        return {"available": False, "monospace_cjk": "", "sans_serif_cjk": ""}
+
+    def family(pattern: str) -> str:
+        proc = run(["fc-match", "-f", "%{family[0]}", pattern])
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+
+    return {
+        "available": True,
+        "monospace_cjk": family("monospace:lang=zh-cn"),
+        "sans_serif_cjk": family("sans-serif:lang=zh-cn"),
+    }
+
+
+def profile_default_im() -> str:
+    path = Path.home() / ".config/fcitx5/profile"
+    if not path.is_file():
+        return ""
+    for line in read_text(path).splitlines():
+        if line.startswith("DefaultIM="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def collect_fcitx5() -> dict:
+    running = ""
+    if shutil.which("fcitx5-remote"):
+        proc = run(["fcitx5-remote", "-n"])
+        if proc.returncode == 0:
+            running = proc.stdout.strip()
+    profile = profile_default_im()
+    return {
+        "available": bool(running or profile),
+        "default_im": profile or running,
+        "running_im": running,
+        "profile_im": profile,
+    }
+
+
+def collect_machine() -> dict:
+    return {
+        "vendor": read_dmi("sys_vendor"),
+        "product": read_dmi("product_name"),
+        "hostname": socket.gethostname(),
+    }
+
+
+def collect_terminal(root: Path) -> dict:
+    installed = [name for name in TERMINALS if shutil.which(name)]
+    return {
+        "primary": detect_primary_terminal(root / "niri/config.kdl", installed),
+        "installed": installed,
+    }
+
+
+def collect_live(root: Path) -> tuple[dict, list[str]]:
+    errors: list[str] = []
+    data: dict = {}
+
+    data["machine"] = collect_machine()
+
+    try:
+        data["outputs"] = collect_outputs()
+    except DoctorError as exc:
+        data["outputs"] = []
+        errors.append(f"输出：{exc}")
+    output_names = [output["name"] for output in data["outputs"]]
+
+    data["terminal"] = collect_terminal(root)
+
+    try:
+        data["brightness"] = collect_brightness()
+    except DoctorError as exc:
+        data["brightness"] = {"devices": [], "internal": ""}
+        errors.append(f"背光：{exc}")
+
+    data["ddc"] = collect_ddc(output_names)
+
+    data["niri"] = collect_niri_config()
+    if not data["niri"]["available"]:
+        errors.append(f"niri 配置：读不到 {data['niri']['config']}")
+
+    data["fontconfig"] = collect_fontconfig()
+    data["fcitx5"] = collect_fcitx5()
+    return data, errors
+
+
+# ---------- facts.toml ----------
+
+
+def prior_known(path: Path) -> list[dict]:
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    known = data.get("known", [])
+    if not isinstance(known, list):
+        return []
+    return [
+        {"path": item["path"], "reason": item.get("reason", "")}
+        for item in known
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    ]
+
+
+def prior_outputs(path: Path) -> list[dict]:
+    """旧 facts 里的输出基线；--refresh 时用来保留当前 off 的输出。"""
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    result = []
+    for item in data.get("outputs", []):
+        if not (
+            isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and isinstance(item.get("current"), str)
+            and isinstance(item.get("scale"), (int, float))
+            and isinstance(item.get("position"), list)
+            and len(item["position"]) == 2
+        ):
+            continue
+        result.append(
+            {
+                "name": item["name"],
+                "make": item.get("make", ""),
+                "current": item["current"],
+                "modes": item.get("modes", []),
+                "scale": float(item["scale"]),
+                "position": [int(item["position"][0]), int(item["position"][1])],
+            }
+        )
+    return result
+
+
+def prior_brightness(path: Path) -> dict:
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    item = data.get("brightness")
+    if not isinstance(item, dict):
+        return {}
+    return {
+        "internal": item.get("internal", ""),
+        "external_connector": item.get("external_connector", ""),
+        "external_vcp": item.get("external_vcp", 16),
+    }
+
+
+def facts_text(facts: dict) -> str:
+    machine = facts["machine"]
+    terminal = facts["terminal"]
+    brightness = facts["brightness"]
+    niri = facts["niri"]
+    fontconfig = facts["fontconfig"]
+    fcitx5 = facts["fcitx5"]
+    lines = [
+        "# 真机事实基线：由 ./doctor/doctor --refresh 采集，勿手改。",
+        "# doctor 用它对照 README 环境段、kanshi/config、check-sync 与当前真机。",
+        "# 夜间光/色温没有查询接口，不采集。",
+        "",
+        "[machine]",
+        f"vendor = {dotenv(machine['vendor'])}",
+        f"product = {dotenv(machine['product'])}",
+        f"hostname = {dotenv(machine['hostname'])}",
+        "",
+        "[terminal]",
+        f"primary = {dotenv(terminal['primary'])}",
+        "installed = [" + ", ".join(dotenv(item) for item in terminal["installed"]) + "]",
+    ]
+    for output in facts["outputs"]:
+        lines += [
+            "",
+            "[[outputs]]",
+            f"name = {dotenv(output['name'])}",
+            f"make = {dotenv(output['make'])}",
+            f"current = {dotenv(output['current'])}",
+            f"scale = {float(output['scale'])!r}",
+            f"position = [{output['position'][0]}, {output['position'][1]}]",
+        ]
+        if len(output["modes"]) > 4:
+            lines.append("modes = [")
+            lines.extend(f"    {dotenv(item)}," for item in output["modes"])
+            lines.append("]")
+        else:
+            lines.append("modes = [" + ", ".join(dotenv(item) for item in output["modes"]) + "]")
+
+    lines += [
+        "",
+        "[brightness]",
+        f"internal = {dotenv(brightness['internal'])}",
+        f"external_connector = {dotenv(brightness['external_connector'])}",
+        f"external_vcp = {int(brightness['external_vcp'])}",
+        "",
+        "[niri]",
+        f"scene = {dotenv(niri['scene'])}",
+        "workspaces = [",
+    ]
+    lines.extend(
+        f'    {{ name = {dotenv(item["name"])}, output = {dotenv(item["output"])} }},'
+        for item in niri["workspaces"]
+    )
+    lines.append("]")
+    lines.append("scene_keys = [")
+    lines.extend(
+        f'    {{ key = {dotenv(item["key"])}, action = {dotenv(item["action"])} }},'
+        for item in niri["scene_keys"]
+    )
+    lines.append("]")
+    lines += [
+        "",
+        "[fontconfig]",
+        f"monospace_cjk = {dotenv(fontconfig['monospace_cjk'])}",
+        f"sans_serif_cjk = {dotenv(fontconfig['sans_serif_cjk'])}",
+        "",
+        "[fcitx5]",
+        f"default_im = {dotenv(fcitx5['default_im'])}",
+    ]
+    for item in facts.get("known", []):
+        lines += [
+            "",
+            "[[known]]",
+            f"path = {dotenv(item['path'])}",
+            f"reason = {dotenv(item.get('reason', ''))}",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def load_facts(path: Path) -> dict:
+    try:
+        with path.open("rb") as handle:
+            facts = tomllib.load(handle)
+    except OSError as exc:
+        raise DoctorError(f"读不到事实文件 {path}；先运行 ./doctor/doctor --refresh") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise DoctorError(f"{path} 不是合法 TOML：{exc}") from exc
+
+    def table(name: str) -> dict:
+        value = facts.get(name)
+        if not isinstance(value, dict):
+            raise DoctorError(f"{path} 缺少 [{name}]；先运行 ./doctor/doctor --refresh")
+        return value
+
+    def field(name: str, key: str, kind: type):
+        value = table(name).get(key)
+        if not isinstance(value, kind):
+            raise DoctorError(f"{path} 的 [{name}].{key} 缺失或类型不对")
+        return value
+
+    for key in ("vendor", "product", "hostname"):
+        field("machine", key, str)
+    field("terminal", "primary", str)
+    field("terminal", "installed", list)
+    if not isinstance(facts.get("outputs"), list) or not facts["outputs"]:
+        raise DoctorError(f"{path} 缺少 [[outputs]]；先运行 ./doctor/doctor --refresh")
+    for index, output in enumerate(facts["outputs"]):
+        if not isinstance(output, dict):
+            raise DoctorError(f"{path} 的 [[outputs]] 第 {index + 1} 项不是表")
+        for key, kind in (
+            ("name", str),
+            ("make", str),
+            ("current", str),
+            ("scale", (int, float)),
+            ("position", list),
+            ("modes", list),
+        ):
+            if key not in output or not isinstance(output[key], kind):
+                raise DoctorError(f"{path} 的 [[outputs]] 第 {index + 1} 项缺少或写错 {key}")
+        if len(output["position"]) != 2 or not all(isinstance(item, int) for item in output["position"]):
+            raise DoctorError(f"{path} 的 [[outputs]] {output['name']} position 必须是两个整数")
+    field("brightness", "internal", str)
+    field("brightness", "external_connector", str)
+    field("brightness", "external_vcp", int)
+    field("niri", "scene", str)
+    field("niri", "workspaces", list)
+    field("niri", "scene_keys", list)
+    for item in facts["niri"]["workspaces"]:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not isinstance(item.get("output"), str):
+            raise DoctorError(f"{path} 的 [niri].workspaces 每项需要 name / output")
+    for item in facts["niri"]["scene_keys"]:
+        if not isinstance(item, dict) or not isinstance(item.get("key"), str) or not isinstance(item.get("action"), str):
+            raise DoctorError(f"{path} 的 [niri].scene_keys 每项需要 key / action")
+    field("fontconfig", "monospace_cjk", str)
+    field("fontconfig", "sans_serif_cjk", str)
+    field("fcitx5", "default_im", str)
+    known = facts.get("known", [])
+    if not isinstance(known, list):
+        raise DoctorError(f"{path} 的 known 必须是数组")
+    facts["known"] = [
+        {"path": item["path"], "reason": item.get("reason", "")}
+        for item in known
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    ]
+    return facts
+
+
+class FactsLines:
+    def __init__(self, path: Path, root: Path):
+        self.label = relative(path, root)
+        self.lines = read_text(path).splitlines()
+
+    def _scan(self, section: str, key: str, output: str | None = None) -> int | None:
+        current: str | None = None
+        in_output: str | None = None
+        for index, line in enumerate(self.lines, 1):
+            stripped = line.strip()
+            header = re.match(r"^\[+([^\]]+)\]+$", stripped)
+            if header:
+                current = header.group(1)
+                in_output = None
+                continue
+            if current == "outputs":
+                name = re.match(r'^name\s*=\s*"((?:[^"\\]|\\.)*)"', stripped)
+                if name:
+                    in_output = json.loads(f'"{name.group(1)}"')
+                    continue
+                if (output is None or output == in_output) and re.match(rf"^{re.escape(key)}\s*=", stripped):
+                    return index
+            elif current == section and re.match(rf"^{re.escape(key)}\s*=", stripped):
+                return index
+        return None
+
+    def at(self, section: str, key: str, output: str | None = None) -> str:
+        line = self._scan(section, key, output)
+        return f"{self.label}:{line}" if line else self.label
+
+
+# ---------- README ----------
+
+
+def scene_summary(niri: dict) -> str:
+    keys = " / ".join(f"`{item['key']}` {item['action']}" for item in niri["scene_keys"]) or "无"
+    names = "、".join(f"`{item['name']}`" for item in niri["workspaces"]) or "无"
+    outputs = {item["output"] for item in niri["workspaces"] if item["output"]}
+    output = outputs.pop() if len(outputs) == 1 else ""
+    suffix = f" 固定 `{output}`" if output else ""
+    return f"`{niri['scene'] or '无'}`，{keys}；命名工作区 {names}{suffix}"
+
+
+def render_block(facts: dict) -> list[str]:
+    machine = facts["machine"]
+    terminal = facts["terminal"]
+    brightness = facts["brightness"]
+    name = " ".join(part for part in (machine["vendor"], machine["product"]) if part) or "未知"
+    lines = [
+        MARK_BEGIN,
+        f"- 机型 **{name}**，主机名 `{machine['hostname']}`",
+    ]
+    if facts["outputs"]:
+        parts = []
+        for output in facts["outputs"]:
+            x, y = output["position"]
+            make = output["make"] or "未知厂商"
+            parts.append(
+                f"`{output['name']}` **{short_mode(output['current'])}** "
+                f"scale {short_number(output['scale'])}（{make}，位置 x={x} y={y}）"
+            )
+        lines.append("- 显示：" + "；".join(parts))
+    else:
+        lines.append("- 显示：（niri 未报告任何输出）")
+    internal = brightness["internal"] or "无"
+    external = brightness["external_connector"] or "无"
+    lines.append(
+        f"- 背光：内置屏 `/sys/class/backlight/{internal}`；"
+        f"外接屏 `{external}` 走 `ddcutil` VCP `0x{brightness['external_vcp']:02x}`"
+    )
+    lines.append("- 场景：" + scene_summary(facts["niri"]))
+    installed = "、".join(f"`{item}`" for item in terminal["installed"]) or "无"
+    lines.append(f"- 终端 **{terminal['primary'] or '未知'}**（真机已装：{installed}）")
+    lines.append(MARK_END)
+    return lines
+
+
+def write_readme(path: Path, block: list[str]) -> bool:
+    text = read_text(path)
+    lines = text.splitlines()
+    try:
+        begin = lines.index(MARK_BEGIN)
+        end = lines.index(MARK_END)
+    except ValueError:
+        heading = next(
+            (index for index, line in enumerate(lines) if line.strip() == "## 当前环境"),
+            None,
+        )
+        if heading is None:
+            raise DoctorError(f"{path} 里既没有 {MARK_BEGIN}，也没有「## 当前环境」标题")
+        tail = list(lines[heading + 1 :])
+        while tail and not tail[0].strip():
+            tail.pop(0)
+        lines = lines[: heading + 1] + [""] + block + [""] + tail
+    else:
+        if end < begin:
+            raise DoctorError(f"{path} 的 doctor 标记顺序反了")
+        lines = lines[:begin] + block + lines[end + 1 :]
+    new_text = "\n".join(lines).rstrip("\n") + "\n"
+    if new_text == text:
+        return False
+    path.write_text(new_text, encoding="utf-8")
+    return True
+
+
+def parse_readme(path: Path) -> tuple[dict | None, int | None, list[tuple[int, str]]]:
+    lines = read_text(path).splitlines()
+    try:
+        begin = lines.index(MARK_BEGIN)
+        end = lines.index(MARK_END)
+    except ValueError:
+        return None, None, []
+    if end <= begin:
+        return None, begin + 1, []
+    declared: dict = {
+        "outputs": {},
+        "machine": None,
+        "hostname": None,
+        "terminal": None,
+        "backlight": None,
+        "scene": None,
+    }
+    errors: list[tuple[int, str]] = []
+    for index in range(begin + 1, end):
+        text = lines[index].strip()
+        if not text:
+            continue
+        lineno = index + 1
+        if text.startswith("- 机型 "):
+            match = re.fullmatch(r"- 机型 \*\*(.+?)\*\*，主机名 `([^`]+)`", text)
+            if not match:
+                errors.append((lineno, text))
+            else:
+                declared["machine"], declared["hostname"] = match.group(1), match.group(2)
+            continue
+        if text.startswith("- 显示："):
+            body = text[len("- 显示：") :]
+            if body == "（niri 未报告任何输出）":
+                continue
+            for segment in body.split("；"):
+                match = re.fullmatch(
+                    r"`([^`]+)` \*\*([^*]+)\*\* scale ([0-9.]+)（([^，]*)"
+                    r"，位置 x=(-?\d+) y=(-?\d+)）",
+                    segment,
+                )
+                if not match:
+                    errors.append((lineno, segment))
+                    continue
+                declared["outputs"][match.group(1)] = {
+                    "mode": match.group(2),
+                    "scale": float(match.group(3)),
+                    "make": match.group(4),
+                    "position": [int(match.group(5)), int(match.group(6))],
+                    "line": lineno,
+                }
+            continue
+        if text.startswith("- 终端 "):
+            match = re.fullmatch(r"- 终端 \*\*(.+?)\*\*（真机已装：.*）", text)
+            if not match:
+                errors.append((lineno, text))
+            else:
+                declared["terminal"] = match.group(1)
+            continue
+        if text.startswith("- 背光："):
+            match = re.fullmatch(
+                r"- 背光：内置屏 `/sys/class/backlight/([^`]+)`；外接屏 `([^`]+)` "
+                r"走 `ddcutil` VCP `0x([0-9A-Fa-f]+)`",
+                text,
+            )
+            if not match:
+                errors.append((lineno, text))
+            else:
+                declared["backlight"] = {
+                    "internal": match.group(1),
+                    "connector": match.group(2),
+                    "vcp": int(match.group(3), 16),
+                    "line": lineno,
+                }
+            continue
+        if text.startswith("- 场景："):
+            match = re.fullmatch(r"- 场景：`([^`]+)`，(.+)；命名工作区 (.+?)(?: 固定 `([^`]+)`)?", text)
+            if not match:
+                errors.append((lineno, text))
+            else:
+                keys = [
+                    {"key": key, "action": action}
+                    for key, action in re.findall(r"`([^`]+)` (write|present|ctf)", match.group(2))
+                ]
+                names = re.findall(r"`([^`]+)`", match.group(3))
+                declared["scene"] = {
+                    "scene": match.group(1),
+                    "keys": keys,
+                    "workspaces": names,
+                    "output": match.group(4) or "",
+                    "line": lineno,
+                }
+            continue
+        errors.append((lineno, text))
+    return declared, begin + 1, errors
+
+
+# ---------- check-sync ----------
+
+
+def manifest_lines(root: Path) -> dict[str, int]:
+    path = root / "MANIFEST.tsv"
+    if not path.is_file():
+        return {}
+    mapping = {}
+    for lineno, line in enumerate(read_text(path).splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        source = line.split("\t", 1)[0]
+        mapping[source] = lineno
+    return mapping
+
+
+def known_match(known: list[dict], source: str, destination: str) -> dict | None:
+    candidates = {source}
+    if destination:
+        candidates.add(destination)
+        candidates.add(os.path.expanduser(destination))
+    for item in known:
+        path = item["path"]
+        if path in candidates or os.path.expanduser(path) in candidates:
+            return item
+    return None
+
+
+def check_sync(root: Path) -> list[tuple]:
+    script = root / "tools/check-sync.sh"
+    label = relative(script, root)
+    if not script.is_file():
+        raise DoctorError(f"找不到 {label}；配置同步必须复用仓库现有脚本")
+    try:
+        proc = subprocess.run(
+            ["bash", str(script)],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DoctorError(f"{label} 执行失败：{exc}") from exc
+
+    facts = load_facts(root / "doctor/facts.toml")
+    known = facts["known"]
+    lines = manifest_lines(root)
+    rows: list[tuple] = []
+    counts = {"same": 0, "drift": 0, "DIFF": 0, "MISSING": 0}
+    hit_known: set[str] = set()
+
+    for raw in proc.stdout.splitlines():
+        match = SYNC_RE.match(raw)
+        if not match:
+            continue
+        kind, source, destination, suffix = match.group(1), match.group(2), match.group(3) or "", match.group(4)
+        counts[kind] += 1
+        if kind == "same":
+            continue
+        line_no = lines.get(source)
+        where = f"{relative(root / 'MANIFEST.tsv', root)}:{line_no}" if line_no else relative(root / "MANIFEST.tsv", root)
+        name = f"check-sync {kind} {source} [{where}]"
+        if kind == "drift":
+            rows.append(make_row(name, source, "state 运行时差异，不计失败" + suffix, "INFO"))
+            continue
+        item = known_match(known, source, destination)
+        if item is not None:
+            hit_known.add(item["path"])
+            rows.append(make_row(name, f"known：{item['path']}", item.get("reason", ""), "KNOWN"))
+            continue
+        actual = f"实机缺失：{destination}" if kind == "MISSING" else f"{destination}{suffix}"
+        rows.append(make_row(name, source, actual, "DRIFT"))
+
+    failed = sum(1 for row in rows if row[3] == "DRIFT")
+    if failed == 0 and proc.returncode != 0 and counts["DIFF"] + counts["MISSING"] == 0:
+        rows.append(
+            make_row(
+                f"check-sync 退出码 [{label}]",
+                "0",
+                f"{proc.returncode}，但没有 DIFF/MISSING 行",
+                "DRIFT",
+            )
+        )
+        failed = 1
+    rows.append(
+        make_row(
+            f"check-sync 汇总 [{label}]",
+            f"{sum(counts.values())} 条 MANIFEST",
+            "same {same}，drift {drift}，DIFF {diff}，MISSING {missing}".format(
+                same=counts["same"],
+                drift=counts["drift"],
+                diff=counts["DIFF"],
+                missing=counts["MISSING"],
+            ),
+            "ok" if failed == 0 else "INFO",
+        )
+    )
+    missed = [item for item in known if item["path"] not in hit_known]
+    if missed:
+        rows.append(
+            make_row(
+                "known 未命中",
+                "、".join(item["path"] for item in missed),
+                "check-sync 未报相应差异（已收敛或不在 MANIFEST）",
+                "INFO",
+            )
+        )
+    return rows
+
+
+# ---------- kanshi ----------
+
+
+TOKEN_RE = re.compile(r'"[^"]*"|[{}]|[^\s{}]+')
+
+
+def parse_kanshi(path: Path) -> list[dict]:
+    entries: list[dict] = []
+    profile: str | None = None
+    output: str | None = None
+    output_line = 0
+    mode: str | None = None
+    mode_line = 0
+    depth = 0
+    for lineno, raw in enumerate(read_text(path).splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        tokens = [(match.group(0), lineno) for match in TOKEN_RE.finditer(line)]
+        index = 0
+        while index < len(tokens):
+            token, line_no = tokens[index]
+            if token == "}":
+                if depth == 2 and output is not None:
+                    entries.append(
+                        {
+                            "profile": profile,
+                            "output": output,
+                            "mode": mode,
+                            "line": mode_line if mode else output_line,
+                            "output_line": output_line,
+                        }
+                    )
+                    output = None
+                    mode = None
+                depth -= 1
+                if depth <= 0:
+                    depth = 0
+                    profile = None
+                index += 1
+                continue
+            if token == "{":
+                depth += 1
+                index += 1
+                continue
+            if token == "profile" and depth == 0 and index + 1 < len(tokens):
+                profile = tokens[index + 1][0]
+                index += 2
+                continue
+            if token == "output" and depth == 1 and profile and index + 1 < len(tokens):
+                output = tokens[index + 1][0]
+                output_line = line_no
+                mode = None
+                index += 2
+                if index < len(tokens) and tokens[index][0] == "disable":
+                    entries.append(
+                        {
+                            "profile": profile,
+                            "output": output,
+                            "mode": None,
+                            "line": line_no,
+                            "output_line": line_no,
+                        }
+                    )
+                    output = None
+                    index += 1
+                elif index < len(tokens) and tokens[index][0] == "{":
+                    depth += 1
+                    index += 1
+                continue
+            if token == "mode" and depth == 2 and output and index + 1 < len(tokens):
+                mode = tokens[index + 1][0]
+                mode_line = line_no
+                index += 2
+                continue
+            index += 1
+    return entries
+
+
+def check_kanshi(facts: dict, config: Path, root: Path, live: dict) -> list[tuple]:
+    label = relative(config, root)
+    if not config.is_file():
+        return [make_row(f"kanshi [{label}]", "存在", "缺失", False)]
+    entries = parse_kanshi(config)
+    if not entries:
+        return [make_row(f"kanshi [{label}]", "至少一个 profile", "没有解析到 output", False)]
+
+    live_outputs = {output["name"]: output for output in live.get("outputs", [])}
+    if not live_outputs:
+        live_outputs = {output["name"]: output for output in facts["outputs"]}
+
+    profiles: dict[str, list[dict]] = {}
+    for entry in entries:
+        profiles.setdefault(entry["profile"] or "?", []).append(entry)
+
+    rows: list[tuple] = []
+    adapted = 0
+    for profile, items in profiles.items():
+        missing = sorted({item["output"] for item in items if item["output"] not in live_outputs})
+        bad_modes = []
+        for item in items:
+            if item["mode"] is None or item["output"] not in live_outputs:
+                continue
+            parts = mode_parts(item["mode"])
+            if parts is None:
+                bad_modes.append(f"{item['mode']}（无法解析）")
+                continue
+            available = {
+                (width, height, round(rate, 3))
+                for mode in live_outputs[item["output"]]["modes"]
+                if (parsed := mode_parts(mode))
+                for width, height, rate in [parsed]
+            }
+            if (parts[0], parts[1], round(parts[2], 3)) not in available:
+                bad_modes.append(item["mode"])
+        if missing:
+            detail = "不适配：缺 " + "、".join(missing)
+        elif bad_modes:
+            detail = "不适配：真机无 " + "、".join(bad_modes)
+        else:
+            detail = "可适配"
+            adapted += 1
+        line_no = min(item["output_line"] for item in items)
+        rows.append(
+            make_row(
+                f"kanshi profile {profile} [{label}:{line_no}]",
+                "对当前输出",
+                detail,
+                "ok" if not missing and not bad_modes else "INFO",
+            )
+        )
+    rows.append(
+        make_row(
+            f"kanshi 适配 [{label}]",
+            "至少一个 profile 可适配",
+            f"{adapted}/{len(profiles)} 个（kanshi 未启用也照常判定）",
+            adapted > 0,
+        )
+    )
+    return rows
+
+
+# ---------- 检查 ----------
+
+
+def make_row(name: str, declared: str, actual: str, status) -> tuple[str, str, str, str]:
+    if status is True:
+        verdict = "ok"
+    elif status is False:
+        verdict = "DRIFT"
+    else:
+        verdict = str(status)
+    return name, declared, actual, verdict
+
+
+# ---------- baseline ----------
+
+
+BASELINE_HEADER = [
+    "# doctor baseline —— 已接受的既有漂移，不是忽略列表。",
+    "# id 是检查项的稳定标识；observed 是「声明值 / 实际值」的 sha256（HOME 归一化成 ~）。",
+    "# 观测值一变就会重新报 DRIFT；--accept 按当前漂移重写本文件，排序稳定。",
+    "# 修好漂移后跑 ./doctor/doctor --accept 收紧基线；doctor 不会自动删条目。",
+]
+
+
+def normalize_home(text: str) -> str:
+    return text.replace(str(Path.home()), "~")
+
+
+def stable_id(name: str) -> str:
+    """去掉行号/文件后缀，得到跨运行稳定的检查 id。"""
+    return re.sub(r"\s+\[[^\]]*\]$", "", name).strip()
+
+
+def observation_hash(row: tuple[str, str, str, str]) -> str:
+    payload = normalize_home(row[1]) + "\x1f" + normalize_home(row[2])
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def observation_detail(row: tuple[str, str, str, str]) -> str:
+    return normalize_home(f"{row[1]} -> {row[2]}")
+
+
+def load_baseline(path: Path) -> dict[str, dict]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except OSError as exc:
+        raise DoctorError(f"读不到基线文件 {path}：{exc}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise DoctorError(f"{path} 不是合法 TOML：{exc}") from exc
+    items = data.get("baseline", [])
+    if not isinstance(items, list):
+        raise DoctorError(f"{path} 的 baseline 必须是数组")
+    result: dict[str, dict] = {}
+    for index, item in enumerate(items, 1):
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not isinstance(item.get("observed"), str):
+            raise DoctorError(f"{path} 的 baseline 第 {index} 项需要 id / observed")
+        if item["id"] in result:
+            raise DoctorError(f"{path} 的 baseline id 重复：{item['id']}")
+        result[item["id"]] = {
+            "observed": item["observed"],
+            "detail": item.get("detail", ""),
+            "reason": item.get("reason", ""),
+        }
+    return result
+
+
+def baseline_text(entries: dict[str, dict]) -> str:
+    lines = list(BASELINE_HEADER) + [""]
+    for key in sorted(entries):
+        item = entries[key]
+        lines += [
+            "[[baseline]]",
+            f"id = {dotenv(key)}",
+            f"observed = {dotenv(item['observed'])}",
+        ]
+        if item.get("detail"):
+            lines.append(f"detail = {dotenv(item['detail'])}")
+        if item.get("reason"):
+            lines.append(f"reason = {dotenv(item['reason'])}")
+        lines.append("")
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def write_baseline(path: Path, rows: list[tuple], existing: dict[str, dict]) -> dict[str, dict]:
+    entries: dict[str, dict] = {}
+    for row in rows:
+        if row[3] != "DRIFT":
+            continue
+        key = stable_id(row[0])
+        if key == "check-sync 汇总":
+            continue
+        entries[key] = {
+            "observed": observation_hash(row),
+            "detail": observation_detail(row),
+            "reason": existing.get(key, {}).get("reason", ""),
+        }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(baseline_text(entries), encoding="utf-8")
+    return entries
+
+
+def apply_baseline(rows: list[tuple], baseline: dict[str, dict]) -> list[tuple]:
+    result: list[tuple] = []
+    used: set[str] = set()
+    for row in rows:
+        name, declared, actual, status = row
+        if status != "DRIFT":
+            result.append(row)
+            continue
+        key = stable_id(name)
+        entry = baseline.get(key)
+        if entry is None:
+            result.append(row)
+            continue
+        used.add(key)
+        if entry["observed"] == observation_hash(row):
+            result.append((name, declared, actual, "BASELINED"))
+        else:
+            old = entry.get("detail") or entry["observed"]
+            result.append(
+                (
+                    name,
+                    declared,
+                    f"{actual}（旧观测：{clip(old, 44)}）",
+                    "DRIFT 值变",
+                )
+            )
+    for key in sorted(baseline):
+        if key in used:
+            continue
+        entry = baseline[key]
+        result.append(
+            (
+                f"baseline 已修复 {key}",
+                clip(entry.get("detail") or entry["observed"], 60),
+                "当前未漂移：已修复，可 --accept 收紧基线",
+                "INFO",
+            )
+        )
+    return result
+
+
+def check_readme(facts: dict, readme: Path, root: Path) -> list[tuple]:
+    declared, start, errors = parse_readme(readme)
+    label = relative(readme, root)
+    if declared is None:
+        hint = f"{label}:{start}" if start else label
+        return [make_row(f"README 环境段 [{hint}]", "存在 doctor 标记段", "缺失", False)]
+    rows: list[tuple] = []
+    for lineno, text in errors:
+        rows.append(make_row(f"README 格式 [{label}:{lineno}]", clip(text), "无法解析", False))
+
+    want_machine = f"{facts['machine']['vendor']} {facts['machine']['product']}".strip()
+    got_machine = declared.get("machine")
+    rows.append(
+        make_row(
+            f"README 机型 [{label}:{start}]",
+            got_machine if got_machine is not None else "缺失",
+            want_machine,
+            got_machine == want_machine,
+        )
+    )
+    rows.append(
+        make_row(
+            f"README 主机名 [{label}:{start}]",
+            declared.get("hostname") if declared.get("hostname") is not None else "缺失",
+            facts["machine"]["hostname"],
+            declared.get("hostname") == facts["machine"]["hostname"],
+        )
+    )
+    rows.append(
+        make_row(
+            f"README 终端 [{label}:{start}]",
+            declared.get("terminal") if declared.get("terminal") is not None else "缺失",
+            facts["terminal"]["primary"],
+            declared.get("terminal") == facts["terminal"]["primary"],
+        )
+    )
+
+    for output in facts["outputs"]:
+        name = output["name"]
+        found = declared["outputs"].get(name)
+        if found is None:
+            rows.append(
+                make_row(
+                    f"README 输出 {name} [{label}]",
+                    "缺失",
+                    f"`{name}` {short_mode(output['current'])}",
+                    False,
+                )
+            )
+            continue
+        where = found["line"]
+        x, y = output["position"]
+        rows += [
+            make_row(
+                f"README {name} 模式 [{label}:{where}]",
+                found["mode"],
+                short_mode(output["current"]),
+                found["mode"] == short_mode(output["current"]),
+            ),
+            make_row(
+                f"README {name} scale [{label}:{where}]",
+                short_number(found["scale"]),
+                short_number(output["scale"]),
+                abs(float(found["scale"]) - float(output["scale"])) < 1e-9,
+            ),
+            make_row(
+                f"README {name} 位置 [{label}:{where}]",
+                f"x={found['position'][0]} y={found['position'][1]}",
+                f"x={x} y={y}",
+                found["position"] == [x, y],
+            ),
+            make_row(
+                f"README {name} 厂商 [{label}:{where}]",
+                found["make"],
+                output["make"] or "未知厂商",
+                found["make"] == (output["make"] or "未知厂商"),
+            ),
+        ]
+    for name in declared["outputs"]:
+        if all(output["name"] != name for output in facts["outputs"]):
+            found = declared["outputs"][name]
+            rows.append(
+                make_row(
+                    f"README 输出 {name} [{label}:{found['line']}]",
+                    f"{name} {found['mode']}",
+                    "真机不存在",
+                    False,
+                )
+            )
+
+    backlight = declared.get("backlight")
+    want = facts["brightness"]
+    if backlight is None:
+        rows.append(make_row(f"README 背光 [{label}]", "缺失", "doctor 渲染行", False))
+    else:
+        rows.append(
+            make_row(
+                f"README 背光 [{label}:{backlight['line']}]",
+                f"{backlight['internal']} / {backlight['connector']} VCP 0x{backlight['vcp']:02x}",
+                f"{want['internal']} / {want['external_connector']} VCP 0x{want['external_vcp']:02x}",
+                backlight["internal"] == want["internal"]
+                and backlight["connector"] == want["external_connector"]
+                and backlight["vcp"] == want["external_vcp"],
+            )
+        )
+
+    scene = declared.get("scene")
+    if scene is None:
+        rows.append(make_row(f"README 场景 [{label}]", "缺失", "doctor 渲染行", False))
+    else:
+        want_scene = facts["niri"]
+        want_keys = sorted((item["key"], item["action"]) for item in want_scene["scene_keys"])
+        got_keys = sorted((item["key"], item["action"]) for item in scene["keys"])
+        want_names = [item["name"] for item in want_scene["workspaces"]]
+        want_output = {item["output"] for item in want_scene["workspaces"]}
+        output = want_output.pop() if len(want_output) == 1 else ""
+        rows.append(
+            make_row(
+                f"README 场景 [{label}:{scene['line']}]",
+                f"{scene['scene']}；{' / '.join(f'{key} {action}' for key, action in got_keys)}；"
+                f"{'、'.join(scene['workspaces'])}{' 固定 ' + scene['output'] if scene['output'] else ''}",
+                f"{want_scene['scene']}；{' / '.join(f'{key} {action}' for key, action in want_keys)}；"
+                f"{'、'.join(want_names)}{' 固定 ' + output if output else ''}",
+                scene["scene"] == want_scene["scene"]
+                and got_keys == want_keys
+                and scene["workspaces"] == want_names
+                and scene["output"] == output,
+            )
+        )
+    return rows
+
+
+def check_host(facts: dict, live: dict, errors: list[str], facts_path: Path, root: Path) -> list[tuple]:
+    label = relative(facts_path, root)
+    lines = FactsLines(facts_path, root)
+    rows: list[tuple] = []
+    for error in errors:
+        rows.append(make_row(f"真机采集 [{label}]", "可读取", error, "SKIP"))
+
+    for key in ("vendor", "product", "hostname"):
+        rows.append(
+            make_row(
+                f"真机 machine.{key} [{lines.at('machine', key)}]",
+                facts["machine"][key],
+                live["machine"][key],
+                facts["machine"][key] == live["machine"][key],
+            )
+        )
+    rows.append(
+        make_row(
+            f"真机 terminal.primary [{lines.at('terminal', 'primary')}]",
+            facts["terminal"]["primary"],
+            live["terminal"]["primary"],
+            facts["terminal"]["primary"] == live["terminal"]["primary"],
+        )
+    )
+    rows.append(
+        make_row(
+            f"真机 terminal.installed [{lines.at('terminal', 'installed')}]",
+            "、".join(facts["terminal"]["installed"]) or "无",
+            "、".join(live["terminal"]["installed"]) or "无",
+            facts["terminal"]["installed"] == live["terminal"]["installed"],
+        )
+    )
+
+    declared_outputs = {output["name"]: output for output in facts["outputs"]}
+    actual_outputs = {output["name"]: output for output in live["outputs"]}
+    if not actual_outputs:
+        rows.append(make_row(f"真机输出 [{label}]", "可读取", "niri 未返回输出", "SKIP"))
+    for name in sorted(set(declared_outputs) | set(actual_outputs), key=str.casefold) if actual_outputs else []:
+        if name not in actual_outputs:
+            rows.append(
+                make_row(
+                    f"真机输出 {name} [{lines.at('outputs', 'name', name)}]",
+                    "存在",
+                    "已消失",
+                    False,
+                )
+            )
+            continue
+        if name not in declared_outputs:
+            rows.append(
+                make_row(
+                    f"真机输出 {name} [{label}]",
+                    "未记录",
+                    f"{short_mode(actual_outputs[name]['current'])}",
+                    False,
+                )
+            )
+            continue
+        want = declared_outputs[name]
+        got = actual_outputs[name]
+        if not got.get("enabled", True):
+            available = {mode_parts(mode) for mode in got["modes"]}
+            wanted = mode_parts(want["current"])
+            found = bool(wanted) and any(
+                item and (item[0], item[1], round(item[2], 3)) == (wanted[0], wanted[1], round(wanted[2], 3))
+                for item in available
+            )
+            rows.append(
+                make_row(
+                    f"真机 {name} 当前 off [{lines.at('outputs', 'current', name)}]",
+                    f"{short_mode(want['current'])} 在可用模式",
+                    "连接器存在；当前 off（策略允许），基线模式可用" if found else "基线模式不在可用列表",
+                    found,
+                )
+            )
+            continue
+        x, y = want["position"]
+        gx, gy = got["position"]
+        fields = (
+            ("current", short_mode(want["current"]), short_mode(got["current"])),
+            ("scale", short_number(want["scale"]), short_number(got["scale"])),
+            ("position", f"x={x} y={y}", f"x={gx} y={gy}"),
+            ("make", want["make"], got["make"]),
+        )
+        for key, before, after in fields:
+            rows.append(
+                make_row(
+                    f"真机 {name}.{key} [{lines.at('outputs', key, name)}]",
+                    before,
+                    after,
+                    before == after,
+                )
+            )
+
+    want_backlight = facts["brightness"]
+    got_backlight = live["brightness"]
+    rows.append(
+        make_row(
+            f"真机 背光设备 [{lines.at('brightness', 'internal')}]",
+            want_backlight["internal"] or "无",
+            got_backlight["internal"] or "无",
+            want_backlight["internal"] == got_backlight["internal"],
+        )
+    )
+
+    ddc = live["ddc"]
+    if not want_backlight["external_connector"]:
+        rows.append(
+            make_row(
+                f"真机 外接亮度 VCP 0x{want_backlight['external_vcp']:02x} [{lines.at('brightness', 'external_connector')}]",
+                "未记录",
+                "facts 没有外接屏基线",
+                "SKIP",
+            )
+        )
+    elif not ddc["available"]:
+        rows.append(
+            make_row(
+                f"真机 外接亮度 VCP 0x{want_backlight['external_vcp']:02x} [{lines.at('brightness', 'external_connector')}]",
+                want_backlight["external_connector"],
+                ddc.get("error") or "ddcutil 不可用",
+                "SKIP",
+            )
+        )
+    else:
+        match = next(
+            (item for item in ddc["external"] if item["connector"] == want_backlight["external_connector"]),
+            None,
+        )
+        rows.append(
+            make_row(
+                f"真机 外接亮度 VCP 0x{want_backlight['external_vcp']:02x} [{lines.at('brightness', 'external_connector')}]",
+                want_backlight["external_connector"] or "无",
+                (
+                    f"{match['connector']} 可读（{match['current']}/{match['max']}）"
+                    if match
+                    else "无对应显示器"
+                ),
+                match is not None,
+            )
+        )
+
+    niri = live["niri"]
+    if not niri["available"]:
+        rows.append(make_row(f"真机 niri 配置 [{label}]", "可读取", niri["config"], "SKIP"))
+    else:
+        actual_workspaces = {item["name"]: item["output"] for item in niri["workspaces"]}
+        for item in facts["niri"]["workspaces"]:
+            rows.append(
+                make_row(
+                    f"真机 工作区 {item['name']} [{lines.at('niri', 'workspaces')}]",
+                    f"open-on-output {item['output']}",
+                    f"open-on-output {actual_workspaces[item['name']]}" if item["name"] in actual_workspaces else "未声明",
+                    actual_workspaces.get(item["name"]) == item["output"],
+                )
+            )
+        actual_keys = {(item["key"], item["action"]) for item in niri["scene_keys"]}
+        for item in facts["niri"]["scene_keys"]:
+            rows.append(
+                make_row(
+                    f"真机 场景键 {item['key']} [{lines.at('niri', 'scene_keys')}]",
+                    f"scene {item['action']}",
+                    "已声明" if (item["key"], item["action"]) in actual_keys else "未声明",
+                    (item["key"], item["action"]) in actual_keys,
+                )
+            )
+        scene_path = Path(os.path.expanduser(facts["niri"]["scene"]))
+        rows.append(
+            make_row(
+                f"真机 场景脚本 [{lines.at('niri', 'scene')}]",
+                facts["niri"]["scene"] or "无",
+                "可执行" if scene_path.is_file() and os.access(scene_path, os.X_OK) else "缺失或不可执行",
+                bool(facts["niri"]["scene"]) and scene_path.is_file() and os.access(scene_path, os.X_OK),
+            )
+        )
+
+    fontconfig = live["fontconfig"]
+    if not fontconfig["available"]:
+        rows.append(make_row(f"真机 fontconfig [{lines.at('fontconfig', 'monospace_cjk')}]", "fc-match 可用", "缺失", "SKIP"))
+    else:
+        for key in ("monospace_cjk", "sans_serif_cjk"):
+            rows.append(
+                make_row(
+                    f"真机 fontconfig.{key} [{lines.at('fontconfig', key)}]",
+                    facts["fontconfig"][key],
+                    fontconfig[key],
+                    facts["fontconfig"][key] == fontconfig[key],
+                )
+            )
+
+    fcitx5 = live["fcitx5"]
+    if not fcitx5["available"]:
+        rows.append(make_row(f"真机 fcitx5 [{lines.at('fcitx5', 'default_im')}]", "可查询", "未运行且无 profile", "SKIP"))
+    else:
+        rows.append(
+            make_row(
+                f"真机 fcitx5 默认输入法 [{lines.at('fcitx5', 'default_im')}]",
+                facts["fcitx5"]["default_im"],
+                fcitx5["profile_im"] or fcitx5["default_im"] or "未知",
+                facts["fcitx5"]["default_im"] == (fcitx5["profile_im"] or fcitx5["default_im"]),
+            )
+        )
+        if fcitx5["running_im"]:
+            rows.append(
+                make_row(
+                    "真机 fcitx5 当前激活输入法",
+                    "随焦点变化，不作基线",
+                    fcitx5["running_im"],
+                    "INFO",
+                )
+            )
+    return rows
+
+
+def build_rows(facts: dict, readme: Path, root: Path, live: dict, errors: list[str], facts_path: Path) -> list[tuple]:
+    rows: list[tuple] = []
+    rows += check_readme(facts, readme, root)
+    rows += check_sync(root)
+    rows += check_host(facts, live, errors, facts_path, root)
+    rows += check_kanshi(facts, root / "kanshi/config", root, live)
+    return rows
+
+
+# ---------- 输出 ----------
+
+
+def print_rows(rows: list[tuple[str, str, str, str]]) -> None:
+    headers = ("检查项", "声明值", "实际值", "判定")
+    widths = [display_width(item) for item in headers]
+    clipped = []
+    for row in rows:
+        values = [clip(value) for value in row]
+        clipped.append(values)
+        widths = [max(width, display_width(value)) for width, value in zip(widths, values)]
+    widths = [min(width, 62) for width in widths]
+    print(" | ".join(pad(value, width) for value, width in zip(headers, widths)))
+    print("-+-".join("-" * width for width in widths))
+    for values in clipped:
+        print(" | ".join(pad(value, width) for value, width in zip(values, widths)))
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="doctor",
+        description="对照 doctor/facts.toml、README、kanshi/config 与真机状态；仓库同步复用 tools/check-sync.sh。",
+    )
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent, help=argparse.SUPPRESS)
+    parser.add_argument("--refresh", action="store_true", help="从真机重采事实并重写 doctor/facts.toml")
+    parser.add_argument("--render", action="store_true", help="按事实重写 README 的 doctor environment 段")
+    parser.add_argument("--accept", action="store_true", help="把当前所有 DRIFT 写进 doctor/baseline.toml")
+    args = parser.parse_args(argv)
+
+    root = args.root.resolve()
+    facts_path = root / "doctor/facts.toml"
+    baseline_path = root / "doctor/baseline.toml"
+    readme = root / "README.md"
+
+    if not (root / "README.md").is_file() or not (root / "tools/check-sync.sh").is_file():
+        raise DoctorError(f"{root} 不像仓库根目录（缺 README.md 或 tools/check-sync.sh）")
+
+    if args.refresh:
+        live, errors = collect_live(root)
+        if not live["outputs"]:
+            raise DoctorError("采不到 niri 输出；请在 niri 会话里运行 --refresh")
+        known = prior_known(facts_path)
+        prior = {output["name"]: output for output in prior_outputs(facts_path)}
+        live_by = {output["name"]: output for output in live["outputs"]}
+        order = list(prior) + [name for name in live_by if name not in prior]
+        merged = []
+        for name in order:
+            if name in live_by:
+                item = dict(live_by[name])
+                if not item["enabled"]:
+                    if name in prior:
+                        item["current"] = prior[name]["current"]
+                        item["scale"] = prior[name]["scale"]
+                        item["position"] = prior[name]["position"]
+                    else:
+                        item["current"] = item["modes"][0] if item["modes"] else ""
+                        item["scale"] = 1.0
+                        item["position"] = [0, 0]
+                item.pop("enabled", None)
+                merged.append(item)
+            elif name in prior:
+                merged.append(prior[name])
+        external = live["ddc"]["external"][0] if live["ddc"].get("external") else {}
+        prior_bright = prior_brightness(facts_path)
+        facts = {
+            "machine": live["machine"],
+            "terminal": live["terminal"],
+            "outputs": merged,
+            "brightness": {
+                "internal": live["brightness"]["internal"] or prior_bright.get("internal", ""),
+                "external_connector": external.get("connector") or prior_bright.get("external_connector", ""),
+                "external_vcp": prior_bright.get("external_vcp", 16) or 16,
+            },
+            "niri": {
+                "scene": live["niri"]["scene"],
+                "workspaces": live["niri"]["workspaces"],
+                "scene_keys": live["niri"]["scene_keys"],
+            },
+            "fontconfig": live["fontconfig"],
+            "fcitx5": live["fcitx5"],
+            "known": known,
+        }
+        facts_path.parent.mkdir(parents=True, exist_ok=True)
+        new_text = facts_text(facts)
+        changed = not facts_path.exists() or read_text(facts_path) != new_text
+        if changed:
+            facts_path.write_text(new_text, encoding="utf-8")
+        print(
+            f"{relative(facts_path, root)}：{'已更新' if changed else '无变化'}"
+            f"（{len(facts['outputs'])} 个输出，终端 {facts['terminal']['primary'] or '未知'}，"
+            f"known {len(known)} 条）"
+        )
+        for error in errors:
+            print(f"  SKIP {error}")
+
+    if args.render:
+        facts = load_facts(facts_path)
+        changed = write_readme(readme, render_block(facts))
+        print(f"{relative(readme, root)} 环境段：{'已更新' if changed else '无变化'}")
+
+    if args.refresh or args.render:
+        if not args.accept:
+            if args.refresh and args.render:
+                print("提示：再跑 ./doctor/doctor 确认没有剩余漂移")
+            return 0
+
+    facts = load_facts(facts_path)
+    live, errors = collect_live(root)
+    rows = build_rows(facts, readme, root, live, errors, facts_path)
+
+    if args.accept:
+        existing = load_baseline(baseline_path)
+        entries = write_baseline(baseline_path, rows, existing)
+        print(f"{relative(baseline_path, root)}：已接受 {len(entries)} 条漂移")
+        for key in sorted(entries):
+            print(f"  accept {key}")
+        print("提示：再跑 ./doctor/doctor，命中 baseline 的项应显示 BASELINED")
+        return 0
+
+    baseline = load_baseline(baseline_path)
+    rows = apply_baseline(rows, baseline)
+    print_rows(rows)
+
+    drift = sum(1 for row in rows if row[3].startswith("DRIFT"))
+    baselined = sum(1 for row in rows if row[3] == "BASELINED")
+    fixed = sum(1 for row in rows if row[0].startswith("baseline 已修复 "))
+    skipped = sum(1 for row in rows if row[3] == "SKIP")
+    known_hits = sum(1 for row in rows if row[3] == "KNOWN")
+    print()
+    print(
+        f"# 检查 {len(rows)} 项：漂移 {drift}，BASELINED {baselined}，"
+        f"已修复 {fixed}，known {known_hits}，跳过 {skipped}"
+    )
+    if drift:
+        print("# 新增或变值的漂移需要人看；确认接受后跑 ./doctor/doctor --accept")
+        print("# README 段可自动更新：./doctor/doctor --render")
+        print("# 事实过期可重采：./doctor/doctor --refresh（改完事实再看 README）")
+        return 1
+    if fixed:
+        print("# 有已修复的 baseline 条目；跑 ./doctor/doctor --accept 收紧基线")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except DoctorError as error:
+        print(f"doctor: {error}", file=sys.stderr)
+        sys.exit(2)
