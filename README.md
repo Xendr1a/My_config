@@ -30,6 +30,8 @@
 <!-- doctor:begin environment -->
 - 机型 **COLORFUL G16 24**，主机名 `Xen`
 - 显示：`eDP-1` **2560x1600@240** scale 1.5（BOE，位置 x=5440 y=-700）；`HDMI-A-1` **1920x1080@240** scale 1（PNP(SAC)，位置 x=3520 y=360）
+- 背光：内置屏 `/sys/class/backlight/nvidia_0`；外接屏 `HDMI-A-1` 走 `ddcutil` VCP `0x10`
+- 场景：`~/.local/bin/scene`，`Mod+Shift+W` write / `Mod+Shift+D` present / `Mod+Shift+T` ctf；命名工作区 `写作`、`打题` 固定 `HDMI-A-1`
 - 终端 **alacritty**（真机已装：`alacritty`、`foot`）
 <!-- doctor:end environment -->
 
@@ -41,16 +43,24 @@
 
 ## 环境自检（doctor）
 
-`doctor/facts.toml` 是唯一事实基线：由真机采集，可编辑、可 diff。`./doctor/doctor` 用它对照 README 的 `doctor:begin/end environment` 段、`kanshi/config`、`MANIFEST.tsv` 与当前真机；全部一致退出 0，任一漂移退出 1，并指出文件和行号。
+`doctor/facts.toml` 是唯一事实基线：由真机采集，可编辑、可 diff。doctor 不重复实现仓库 ↔ 实机同步，只补 `tools/check-sync.sh` 没覆盖的维度：
+
+- 配置同步：直接调用 `tools/check-sync.sh`，按它的 `same` / `drift` / `DIFF` / `MISSING` 行出表；`facts.toml` 的 `[[known]]` 命中的差异只打印（`KNOWN`），不计失败。
+- 本机事实：hostname、显示器连接器 / 当前模式 / 缩放（当前 off 的输出改为校验基线模式仍在可用列表）、背光设备、外接屏 `ddcutil` VCP `0x10`。
+- niri 命名工作区与 `~/.local/bin/scene` 三个键位、kanshi profile 对当前输出的适配（kanshi 没启用也照常判定）。
+- fontconfig 实际中文解析结果、fcitx5 profile 默认输入法（当前激活输入法随焦点变化，只提示不判定）。
+- README 的 `doctor:begin/end environment` 段由同一份 facts 渲染。
+
+夜间光 / 色温没有查询接口，doctor 不采集。`niri/outputs.kdl` 是 Noctalia 面板维护的单向文件（实机为准），doctor 只沿用 check-sync 的 `state` 语义记录差异，不做仓库↔实机双向判定。
 
 ```shell
 ./doctor/doctor                     # 检查
-./doctor/doctor --refresh           # 从 /sys/class/dmi/id、niri msg --json outputs、已装终端重采事实
+./doctor/doctor --refresh           # 从 DMI、niri、backlight、ddcutil、fc-match、fcitx5、已装终端重采事实
 ./doctor/doctor --render            # 按事实重写 README 环境段
 ./doctor/doctor --refresh --render  # 硬件或布局变了以后一次改完
 ```
 
-doctor 只读 niri、kanshi、alacritty、noctalia 的配置，不会为了变绿去改它们；kanshi 与 MANIFEST 的漂移交回各自维护者。
+doctor 只读 niri、kanshi、alacritty、noctalia 的配置，不会为了变绿去改它们；kanshi、check-sync 报出的真实差异交回各自维护者。
 
 ## 键位速查
 

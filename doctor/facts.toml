@@ -1,5 +1,6 @@
 # 真机事实基线：由 ./doctor/doctor --refresh 采集，勿手改。
-# doctor 用它对照 README 环境段、kanshi/config 与当前真机。
+# doctor 用它对照 README 环境段、kanshi/config、check-sync 与当前真机。
+# 夜间光/色温没有查询接口，不采集。
 
 [machine]
 vendor = "COLORFUL"
@@ -13,21 +14,17 @@ installed = ["alacritty", "foot"]
 [[outputs]]
 name = "eDP-1"
 make = "BOE"
-model = "0x0B87"
 current = "2560x1600@240.000"
 scale = 1.5
 position = [5440, -700]
-transform = "normal"
 modes = ["2560x1600@60.000", "2560x1600@240.000", "2560x1600@144.000", "640x480@59.940"]
 
 [[outputs]]
 name = "HDMI-A-1"
 make = "PNP(SAC)"
-model = "N50pro 6"
 current = "1920x1080@240.000"
 scale = 1.0
 position = [3520, 360]
-transform = "normal"
 modes = [
     "1920x1080@60.000",
     "1920x1080@240.000",
@@ -58,3 +55,35 @@ modes = [
     "640x480@75.000",
     "640x480@59.940",
 ]
+
+[brightness]
+internal = "nvidia_0"
+external_connector = "HDMI-A-1"
+external_vcp = 16
+
+[niri]
+scene = "~/.local/bin/scene"
+workspaces = [
+    { name = "写作", output = "HDMI-A-1" },
+    { name = "打题", output = "HDMI-A-1" },
+]
+scene_keys = [
+    { key = "Mod+Shift+W", action = "write" },
+    { key = "Mod+Shift+D", action = "present" },
+    { key = "Mod+Shift+T", action = "ctf" },
+]
+
+[fontconfig]
+monospace_cjk = "Sarasa Mono SC"
+sans_serif_cjk = "Noto Sans CJK SC"
+
+[fcitx5]
+default_im = "pinyin"
+
+[[known]]
+path = "home/.zshrc"
+reason = "仓库重构版 vs 实机 Dragon Mist 配色版是两套分叉；统一与否挂在「Dragon Mist 是否入库」上（zoxide init 两边都有，不是漂移）"
+
+[[known]]
+path = "~/.local/bin/solo-display"
+reason = "实机游离脚本；My_config 的 MANIFEST 已收则 check-sync 显示 same，此条自动收敛"
