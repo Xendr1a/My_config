@@ -1820,7 +1820,13 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--refresh", action="store_true", help="从真机重采事实并重写 doctor/facts.toml")
     parser.add_argument("--render", action="store_true", help="按事实重写 README 的 doctor environment 段")
     parser.add_argument("--accept", action="store_true", help="把当前所有 DRIFT 写进 doctor/baseline.toml")
-    parser.add_argument("--state-dir", type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--state-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="指定后 last.json 与 doctor.log 写到该目录；用于探针/测试，不污染生产状态（默认 ~/.local/state/doctor/）",
+    )
     report_group = parser.add_mutually_exclusive_group()
     report_group.add_argument("--summary", action="store_true", help="单行晨报；有新增时附最多 5 条明细")
     report_group.add_argument("--json", action="store_true", help="输出稳定 schema 的单个 JSON 对象")
